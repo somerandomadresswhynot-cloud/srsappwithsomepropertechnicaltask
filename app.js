@@ -137,6 +137,10 @@ function autoParseSource(source, parsedSections = []) {
 
 async function parsePdfHeaders(file) {
   if (!window.pdfjsLib) throw new Error('PDF parser not loaded.');
+
+  const pypdfEntries = await parseWithPyPdfService(file);
+  if (pypdfEntries.length >= 4) return pypdfEntries;
+
   const arrayBuffer = await file.arrayBuffer();
   const task = window.pdfjsLib.getDocument({ data: arrayBuffer });
   const pdf = await task.promise;
@@ -211,6 +215,29 @@ async function parsePdfHeaders(file) {
   );
 
   return unique.slice(0, 24).sort((a, b) => a.pageStart - b.pageStart || a.level - b.level);
+}
+
+async function parseWithPyPdfService(file) {
+  const endpoint = localStorage.getItem('srs-pypdf-endpoint') || '/api/parse-pdf-outline';
+  try {
+    const formData = new FormData();
+    formData.append('file', file, file.name || 'source.pdf');
+    const response = await fetch(endpoint, { method: 'POST', body: formData });
+    if (!response.ok) return [];
+    const data = await response.json();
+    if (!Array.isArray(data?.sections)) return [];
+    return data.sections
+      .map(item => ({
+        title: (item.title || '').trim(),
+        pageStart: Number(item.pageStart),
+        level: Number.isInteger(item.level) ? Math.max(0, Math.min(6, item.level)) : 0,
+        score: 30
+      }))
+      .filter(item => item.title && Number.isFinite(item.pageStart) && item.pageStart > 0)
+      .sort((a, b) => a.pageStart - b.pageStart || a.level - b.level);
+  } catch {
+    return [];
+  }
 }
 
 async function parsePdfOutline(pdf) {

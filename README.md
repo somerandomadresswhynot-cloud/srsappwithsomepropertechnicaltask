@@ -14,6 +14,23 @@ python3 -m http.server 4173
 
 Open http://localhost:4173
 
+## Optional: pypdf bookmark parser (recommended)
+
+For best hierarchy extraction, run the local pypdf parser service:
+
+```bash
+pip install pypdf
+python3 pypdf_outline_server.py --port 4174
+```
+
+Then set endpoint once in browser devtools:
+
+```js
+localStorage.setItem('srs-pypdf-endpoint', 'http://localhost:4174/api/parse-pdf-outline')
+```
+
+The app will then parse chapters/sections from PDF bookmarks via pypdf first, and fall back to pdf.js outline/text heuristics if unavailable.
+
 ## Notes
 - The app starts with **no default sources**.
 - Use **Sources → Add Source** to import your own PDF/YouTube/local video metadata.
