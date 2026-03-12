@@ -6,7 +6,7 @@ function defaultState() {
     view: {
       page: 'sources',
       sources: { searchText: '', sourceTypeFilter: 'all', selectedSourceId: null, scrollOffset: 0 },
-      portal: { sourceId: null, selectedHierarchyItemId: null, outlineSearchText: '', viewerPage: 1, viewerZoom: 120 },
+      portal: { sourceId: null, selectedHierarchyItemId: null, outlineSearchText: '', viewerPage: 1, viewerZoom: 120, viewerPositionBySource: {} },
       queue: { selectedUnitId: null, preRecallNote: '', postRecallNote: '', timerRunning: false, timerStartedAt: null, elapsedSec: 0 }
     }
   };
@@ -181,6 +181,172 @@ function deriveYouTubeEmbedUrl(url) {
   return null;
 }
 
+
+function getLocatorForHierarchyItem(source, hierarchyItem) {
+  if (!source || !hierarchyItem) return null;
+
+  if (source.sourceType === 'pdf') {
+    if (!Number.isFinite(hierarchyItem.pageStart)) return null;
+    return {
+      kind: 'page',
+      page: Math.max(1, Math.floor(hierarchyItem.pageStart)),
+      pageEnd: Number.isFinite(hierarchyItem.pageEnd) ? Math.max(Math.floor(hierarchyItem.pageEnd), Math.floor(hierarchyItem.pageStart)) : Math.floor(hierarchyItem.pageStart)
+    };
+  }
+
+  if (source.sourceType === 'youtube' || source.sourceType === 'local_video') {
+    if (!Number.isFinite(hierarchyItem.timeStartSec)) return null;
+    return {
+      kind: 'time',
+      seconds: Math.max(0, Math.floor(hierarchyItem.timeStartSec)),
+      timeEndSec: Number.isFinite(hierarchyItem.timeEndSec) ? Math.max(Math.floor(hierarchyItem.timeEndSec), Math.floor(hierarchyItem.timeStartSec)) : Math.floor(hierarchyItem.timeStartSec)
+    };
+  }
+
+  if (hierarchyItem.locatorStart == null) return null;
+  return {
+    kind: 'locator',
+    locatorType: hierarchyItem.locatorType || 'section',
+    start: hierarchyItem.locatorStart,
+    end: hierarchyItem.locatorEnd ?? hierarchyItem.locatorStart
+  };
+}
+
+function getLocatorForUnit(unit) {
+  if (!unit) return null;
+
+  if (unit.sourceType === 'pdf') {
+    if (!Number.isFinite(unit.pageStart)) return null;
+    return {
+      kind: 'page',
+      page: Math.max(1, Math.floor(unit.pageStart)),
+      pageEnd: Number.isFinite(unit.pageEnd) ? Math.max(Math.floor(unit.pageEnd), Math.floor(unit.pageStart)) : Math.floor(unit.pageStart)
+    };
+  }
+
+  if (unit.sourceType === 'youtube' || unit.sourceType === 'local_video' || unit.sourceType === 'video') {
+    if (!Number.isFinite(unit.timeStartSec)) return null;
+    return {
+      kind: 'time',
+      seconds: Math.max(0, Math.floor(unit.timeStartSec)),
+      timeEndSec: Number.isFinite(unit.timeEndSec) ? Math.max(Math.floor(unit.timeEndSec), Math.floor(unit.timeStartSec)) : Math.floor(unit.timeStartSec)
+    };
+  }
+
+  if (unit.locatorStart == null) return null;
+  return {
+    kind: 'locator',
+    locatorType: unit.locatorType || 'section',
+    start: unit.locatorStart,
+    end: unit.locatorEnd ?? unit.locatorStart
+  };
+}
+
+function createViewerController(source, containerEl) {
+  if (!source || !containerEl) {
+    return {
+      goToPage: () => {},
+      seekTo: () => {},
+      getPosition: () => null,
+      hasLocator: () => false
+    };
+  }
+
+  if (source.sourceType === 'pdf') {
+    return {
+      goToPage(page) {
+        if (!Number.isFinite(page)) return;
+        state.view.portal.viewerPage = Math.max(1, Math.floor(page));
+      },
+      seekTo: () => {},
+      getPosition() {
+        return { kind: 'page', page: state.view.portal.viewerPage || 1 };
+      },
+      hasLocator(locator) {
+        return Boolean(locator && locator.kind === 'page' && Number.isFinite(locator.page));
+      }
+    };
+  }
+
+  if (source.sourceType === 'youtube') {
+    return {
+      goToPage: () => {},
+      seekTo(seconds) {
+        if (!Number.isFinite(seconds)) return;
+        const iframe = containerEl.querySelector('iframe.video-frame');
+        if (!iframe) return;
+        const base = deriveYouTubeEmbedUrl(source.origin || '');
+        if (!base) return;
+        const sec = Math.max(0, Math.floor(seconds));
+        iframe.src = `${base}${base.includes('?') ? '&' : '?'}start=${sec}`;
+      },
+      getPosition() {
+        return null;
+      },
+      hasLocator(locator) {
+        return Boolean(locator && locator.kind === 'time' && Number.isFinite(locator.seconds));
+      }
+    };
+  }
+
+  if (source.sourceType === 'local_video') {
+    return {
+      goToPage: () => {},
+      seekTo(seconds) {
+        if (!Number.isFinite(seconds)) return;
+        const videoEl = containerEl.querySelector('video.video-player');
+        if (!videoEl) return;
+        const sec = Math.max(0, Math.floor(seconds));
+        if (videoEl.readyState >= 1) {
+          try { videoEl.currentTime = sec; } catch {}
+        } else {
+          videoEl.addEventListener('loadedmetadata', () => {
+            try { videoEl.currentTime = sec; } catch {}
+          }, { once: true });
+        }
+      },
+      getPosition() {
+        const videoEl = containerEl.querySelector('video.video-player');
+        if (!videoEl || !Number.isFinite(videoEl.currentTime)) return null;
+        return { kind: 'time', seconds: Math.floor(videoEl.currentTime) };
+      },
+      hasLocator(locator) {
+        return Boolean(locator && locator.kind === 'time' && Number.isFinite(locator.seconds));
+      }
+    };
+  }
+
+  return {
+    goToPage: () => {},
+    seekTo: () => {},
+    getPosition: () => null,
+    hasLocator(locator) {
+      return Boolean(locator);
+    }
+  };
+}
+
+function syncSelectionAcrossPortalAndQueue(source, hierarchyItem, unit) {
+  state.view.portal.selectedHierarchyItemId = hierarchyItem?.id || null;
+  state.view.queue.selectedUnitId = unit?.id || null;
+  if (source?.id && hierarchyItem) {
+    state.view.portal.sourceId = source.id;
+  }
+}
+
+function rememberViewerPosition(sourceId, position) {
+  if (!sourceId || !position) return;
+  const current = state.view.portal.viewerPositionBySource && typeof state.view.portal.viewerPositionBySource === 'object'
+    ? state.view.portal.viewerPositionBySource
+    : {};
+  state.view.portal.viewerPositionBySource = { ...current, [sourceId]: position };
+}
+
+function getSavedViewerPosition(sourceId) {
+  const map = state.view.portal.viewerPositionBySource;
+  if (!sourceId || !map || typeof map !== 'object') return null;
+  return map[sourceId] || null;
+}
 function renderUnsupportedViewer(source, containerEl, reason) {
   containerEl.innerHTML = `<div class="viewer-fallback"><h4>Viewer unavailable</h4><p>${escapeHtml(reason || `No renderer available for source type "${source?.sourceType || 'unknown'}".`)}</p></div>`;
 }
@@ -914,15 +1080,30 @@ function renderPortal() {
     return;
   }
 
+  if (v.sourceId !== source.id) v.sourceId = source.id;
+  const savedPosition = getSavedViewerPosition(source.id);
+  if (savedPosition?.kind === 'page' && Number.isFinite(savedPosition.page)) {
+    v.viewerPage = Math.max(1, Math.floor(savedPosition.page));
+  }
+
   const outline = state.data.hierarchy.filter(h => h.sourceId === source.id);
   const filtered = outline.filter(h => !v.outlineSearchText || h.title.toLowerCase().includes(v.outlineSearchText.toLowerCase()));
   const selected = outline.find(h => h.id === v.selectedHierarchyItemId) || outline[0] || null;
+  const selectedUnit = selected ? state.data.units.find(u => u.sourceId === source.id && u.hierarchyId === selected.id) || null : null;
+  const selectedLocator = selected ? (getLocatorForHierarchyItem(source, selected) || getLocatorForUnit(selectedUnit)) : null;
   const allInQueue = outline.length ? outline.every(item => item.inQueue) : true;
   if (!v.selectedHierarchyItemId && selected) v.selectedHierarchyItemId = selected.id;
 
   pageRoot.innerHTML = `<div class="portal"><aside class="panel"><div style="padding:10px"><h3>${source.title}</h3><input id="outline-search" placeholder="Search outline" value="${v.outlineSearchText}"></div><div class="outline-tools"><span class="small">Queue all</span><button class="queue-master ${allInQueue ? 'queue-on' : 'queue-off'}" id="toggle-all-queue" title="${allInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue'}" aria-label="${allInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue'}"></button></div><div class="outline-list">${filtered.map(item => `<div class="outline-item ${item.id === selected?.id ? 'selected' : ''}" data-item="${item.id}"><div class="indent" style="--depth:${item.depth}">${item.isLeaf ? '📄' : '📁'} ${item.title}</div>${renderQueueBars(item)}</div>`).join('') || '<p class="small" style="padding:8px">No outline items.</p>'}</div></aside>
-  <section class="panel viewer"><div class="row" style="justify-content:space-between"><h3>Viewer</h3><div class="controls"><button class="btn" id="zoom-out">-</button><span>${v.viewerZoom || 120}%</span><button class="btn" id="zoom-in">+</button></div></div><div class="small">${selected?.title || 'No item selected'}</div><div id="portal-viewer-content" class="viewer-doc"></div></section>
+  <section class="panel viewer"><div class="row" style="justify-content:space-between"><h3>Viewer</h3><div class="controls"><button class="btn" id="zoom-out">-</button><span>${v.viewerZoom || 120}%</span><button class="btn" id="zoom-in">+</button><button class="btn" id="portal-jump" ${selectedLocator ? '' : 'disabled'}>Jump to selected</button></div></div><div class="small">${selected?.title || 'No item selected'}</div><div class="small">${selectedLocator ? 'Location available' : 'location unavailable'}</div><div id="portal-viewer-content" class="viewer-doc"></div></section>
   <aside class="panel" style="padding:12px"><h3>Unit Meta</h3><div class="small">Source Type: ${source.sourceType}</div><div class="small">Priority: ${source.priority}</div><div class="small">Units: ${source.totalUnits}</div><div class="small">Queue On/Off via bars in outline.</div></aside></div>`;
+
+  const viewerEl = document.getElementById('portal-viewer-content');
+  renderSourceViewer(source, selectedUnit || selected, viewerEl, {
+    zoomPercent: v.viewerZoom || 120,
+    defaultPage: v.viewerPage || 1
+  });
+  const controller = createViewerController(source, viewerEl);
 
   document.getElementById('outline-search').oninput = e => { v.outlineSearchText = e.target.value; renderPortal(); save(); };
   document.getElementById('toggle-all-queue').onclick = () => {
@@ -932,13 +1113,25 @@ function renderPortal() {
     render();
   };
   document.querySelectorAll('[data-item]').forEach(el => el.onclick = () => {
-    v.selectedHierarchyItemId = el.dataset.item;
-    const item = outline.find(x => x.id === v.selectedHierarchyItemId);
-    const unit = state.data.units.find(u => u.sourceId === source.id && u.hierarchyId === item.id);
-    if (unit) state.view.queue.selectedUnitId = unit.id;
+    const item = outline.find(x => x.id === el.dataset.item);
+    const unit = item ? state.data.units.find(u => u.sourceId === source.id && u.hierarchyId === item.id) || null : null;
+    const locator = item ? (getLocatorForHierarchyItem(source, item) || getLocatorForUnit(unit)) : null;
+    syncSelectionAcrossPortalAndQueue(source, item, unit);
+    if (locator?.kind === 'page') controller.goToPage(locator.page);
+    if (locator?.kind === 'time') controller.seekTo(locator.seconds);
+    rememberViewerPosition(source.id, controller.getPosition() || locator);
     renderPortal();
     save();
   });
+
+  document.getElementById('portal-jump').onclick = () => {
+    if (!selectedLocator) return;
+    if (selectedLocator.kind === 'page') controller.goToPage(selectedLocator.page);
+    if (selectedLocator.kind === 'time') controller.seekTo(selectedLocator.seconds);
+    rememberViewerPosition(source.id, controller.getPosition() || selectedLocator);
+    renderPortal();
+    save();
+  };
 
   const onToggleQueue = e => {
     e.stopPropagation();
@@ -957,18 +1150,7 @@ function renderPortal() {
   document.querySelectorAll('[data-toggle]').forEach(el => el.onclick = onToggleQueue);
   document.getElementById('zoom-in').onclick = () => { v.viewerZoom = Math.min(200, (v.viewerZoom || 120) + 10); renderPortal(); save(); };
   document.getElementById('zoom-out').onclick = () => { v.viewerZoom = Math.max(50, (v.viewerZoom || 120) - 10); renderPortal(); save(); };
-
-  const portalViewerItem = selected
-    ? {
-      title: selected.title,
-      pageStart: selected.pageStart,
-      timeStartSec: state.data.units.find(unit => unit.hierarchyId === selected.id && unit.sourceId === source.id)?.timeStartSec || 0
-    }
-    : null;
-  renderSourceViewer(source, portalViewerItem, document.getElementById('portal-viewer-content'), {
-    zoomPercent: v.viewerZoom || 120,
-    defaultPage: v.viewerPage || 1
-  });
+  rememberViewerPosition(source.id, controller.getPosition() || selectedLocator);
 }
 
 function normalizeQueueSelection() {
@@ -1011,24 +1193,48 @@ function renderQueue() {
   const u = units.find(x => x.id === v.selectedUnitId) || units[0] || null;
   if (!v.selectedUnitId && u) v.selectedUnitId = u.id;
 
+  const queueSource = u ? state.data.sources.find(source => source.id === u.sourceId) || null : null;
+  const queueHierarchyItem = u ? state.data.hierarchy.find(item => item.id === u.hierarchyId) || null : null;
+  const queueLocator = getLocatorForUnit(u) || getLocatorForHierarchyItem(queueSource, queueHierarchyItem);
+
   pageRoot.innerHTML = `<div class="queue"><aside class="panel queue-list"><h2>Study Queue</h2>${units.length ? units.map(x => `<div class="queue-item ${x.id === u?.id ? 'active' : ''}" data-unit="${x.id}"><strong>${x.title}</strong><div class="small">${x.sourceTitle} • ${x.sizeLabel}</div><div>${x.retentionScore}%</div></div>`).join('') : '<p class="small">No units in queue yet. Import a source and keep units enabled in queue from Source Portal.</p>'}</aside>
   <section class="col"><div class="panel" style="padding:12px"><h3>${u?.title || 'No unit selected'}</h3><div class="small">${u ? `${u.sourceTitle} • ${u.pageStart ? `pp.${u.pageStart}-${u.pageEnd}` : `${u.timeStartSec || 0}-${u.timeEndSec || 0}s`}` : 'Select a unit to begin.'}</div><div class="row"><button class="btn" id="open-history" ${u ? '' : 'disabled'}>Review History</button><div class="small">Retention<div>${u?.retentionScore || 0}%</div></div></div></div>
-  <div class="panel" style="padding:12px"><div class="controls"><strong id="timer">${format(v.elapsedSec)}</strong><button class="btn" id="start-stop" ${u ? '' : 'disabled'}>${v.timerRunning ? 'Pause' : 'Start'}</button><button class="btn" id="restart" ${u ? '' : 'disabled'}>Restart</button><button class="btn outcome" data-outcome="easy" ${u ? '' : 'disabled'}>Easy</button><button class="btn outcome" data-outcome="with_effort" ${u ? '' : 'disabled'}>With Effort</button><button class="btn outcome" data-outcome="hard" ${u ? '' : 'disabled'}>Hard</button><button class="btn outcome" data-outcome="skip" ${u ? '' : 'disabled'}>Skip</button></div><div class="row"><textarea id="pre-note" rows="3" placeholder="Pre-recall note" style="flex:1">${v.preRecallNote || ''}</textarea><textarea id="post-note" rows="3" placeholder="Post-recall note" style="flex:1">${v.postRecallNote || ''}</textarea></div></div>
+  <div class="panel" style="padding:12px"><div class="controls"><strong id="timer">${format(v.elapsedSec)}</strong><button class="btn" id="start-stop" ${u ? '' : 'disabled'}>${v.timerRunning ? 'Pause' : 'Start'}</button><button class="btn" id="restart" ${u ? '' : 'disabled'}>Restart</button><button class="btn outcome" data-outcome="easy" ${u ? '' : 'disabled'}>Easy</button><button class="btn outcome" data-outcome="with_effort" ${u ? '' : 'disabled'}>With Effort</button><button class="btn outcome" data-outcome="hard" ${u ? '' : 'disabled'}>Hard</button><button class="btn outcome" data-outcome="skip" ${u ? '' : 'disabled'}>Skip</button><button class="btn" id="queue-jump" ${queueLocator ? '' : 'disabled'}>Jump to unit</button></div><div class="small">${queueLocator ? 'Location available' : 'location unavailable'}</div><div class="row"><textarea id="pre-note" rows="3" placeholder="Pre-recall note" style="flex:1">${v.preRecallNote || ''}</textarea><textarea id="post-note" rows="3" placeholder="Post-recall note" style="flex:1">${v.postRecallNote || ''}</textarea></div></div>
   <div class="panel viewer" style="min-height:220px"><div class="small">${u?.title || 'No unit loaded'}</div><div id="queue-viewer-content" class="viewer-doc"></div></div></section></div>`;
 
-  document.querySelectorAll('[data-unit]').forEach(el => el.onclick = () => { v.selectedUnitId = el.dataset.unit; renderQueue(); save(); });
+  const viewerEl = document.getElementById('queue-viewer-content');
+  renderSourceViewer(queueSource, u, viewerEl, {
+    zoomPercent: state.view.portal.viewerZoom || 120,
+    defaultPage: state.view.portal.viewerPage || 1
+  });
+  const controller = createViewerController(queueSource, viewerEl);
+
+  document.querySelectorAll('[data-unit]').forEach(el => el.onclick = () => {
+    const selectedUnit = units.find(item => item.id === el.dataset.unit) || null;
+    const selectedSource = selectedUnit ? state.data.sources.find(source => source.id === selectedUnit.sourceId) || null : null;
+    const selectedHierarchyItem = selectedUnit ? state.data.hierarchy.find(item => item.id === selectedUnit.hierarchyId) || null : null;
+    const locator = getLocatorForUnit(selectedUnit) || getLocatorForHierarchyItem(selectedSource, selectedHierarchyItem);
+    syncSelectionAcrossPortalAndQueue(selectedSource, selectedHierarchyItem, selectedUnit);
+    if (locator?.kind === 'page') controller.goToPage(locator.page);
+    if (locator?.kind === 'time') controller.seekTo(locator.seconds);
+    if (selectedSource?.id) rememberViewerPosition(selectedSource.id, controller.getPosition() || locator);
+    renderQueue();
+    save();
+  });
+  document.getElementById('queue-jump').onclick = () => {
+    if (!queueLocator) return;
+    if (queueLocator.kind === 'page') controller.goToPage(queueLocator.page);
+    if (queueLocator.kind === 'time') controller.seekTo(queueLocator.seconds);
+    if (queueSource?.id) rememberViewerPosition(queueSource.id, controller.getPosition() || queueLocator);
+    renderQueue();
+    save();
+  };
   document.getElementById('pre-note').oninput = e => { v.preRecallNote = e.target.value; save(); };
   document.getElementById('post-note').oninput = e => { v.postRecallNote = e.target.value; save(); };
   document.getElementById('restart').onclick = () => { v.elapsedSec = 0; v.timerStartedAt = Date.now(); v.timerRunning = true; tick(); save(); renderQueue(); };
   document.getElementById('start-stop').onclick = () => { if (v.timerRunning) { v.elapsedSec += Math.floor((Date.now() - v.timerStartedAt) / 1000); v.timerRunning = false; } else { v.timerStartedAt = Date.now(); v.timerRunning = true; tick(); } save(); renderQueue(); };
   document.querySelectorAll('.outcome').forEach(b => b.onclick = () => u && completeReview(b.dataset.outcome, u));
   document.getElementById('open-history').onclick = () => u && openHistory(u.id);
-
-  const queueSource = u ? state.data.sources.find(source => source.id === u.sourceId) || null : null;
-  renderSourceViewer(queueSource, u, document.getElementById('queue-viewer-content'), {
-    zoomPercent: state.view.portal.viewerZoom || 120,
-    defaultPage: state.view.portal.viewerPage || 1
-  });
 }
 
 function tick() {
