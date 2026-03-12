@@ -17,5 +17,7 @@ Open http://localhost:4173
 ## Notes
 - The app starts with **no default sources**.
 - Use **Sources → Add Source** to import your own PDF/YouTube/local video metadata.
-- Imported sources are auto-parsed into sample outline + atomic review units for queue/testing.
+- The import modal now supports **drag-and-drop** file upload.
+- Dropped PDFs are automatically scanned in-browser for likely section headers, then those headers seed the outline and review units.
+- If parsing cannot detect enough headers, the app falls back to a default section template.
 - State is persisted in `localStorage`.

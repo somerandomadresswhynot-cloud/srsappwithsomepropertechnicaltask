@@ -19,6 +19,7 @@ function isLegacySeedData(data) {
 
 const persisted = JSON.parse(localStorage.getItem('srs-app-state') || 'null');
 const state = persisted && !isLegacySeedData(persisted.data) ? persisted : defaultState();
+const importDraft = { file: null, parsedSections: [], parsing: false };
 
 const save = () => localStorage.setItem('srs-app-state', JSON.stringify(state));
 const pageRoot = document.getElementById('page-root');
@@ -58,7 +59,7 @@ function importSourceFromForm() {
   };
 
   state.data.sources.push(source);
-  autoParseSource(source);
+  autoParseSource(source, importDraft.parsedSections);
   state.view.sources.selectedSourceId = sourceId;
   state.view.portal.sourceId = sourceId;
   state.view.page = 'sources';
@@ -67,15 +68,18 @@ function importSourceFromForm() {
   save();
 }
 
-function autoParseSource(source) {
-  const sections = ['Introduction', 'Core Concepts', 'Examples', 'Practice', 'Summary'];
-  const addedHierarchy = sections.flatMap((title, idx) => {
+function autoParseSource(source, parsedSections = []) {
+  const sections = parsedSections.length
+    ? parsedSections
+    : ['Introduction', 'Core Concepts', 'Examples', 'Practice', 'Summary'].map((title, idx) => ({ title, pageStart: idx * 10 + 1 }));
+
+  const addedHierarchy = sections.flatMap((section, idx) => {
     const parentId = crypto.randomUUID();
     const leafId = crypto.randomUUID();
-    const base = idx * 10 + 1;
+    const pageStart = section.pageStart || idx * 10 + 1;
     return [
-      { id: parentId, sourceId: source.id, parentId: null, title, depth: 0, isLeaf: false, studyState: 'unstudied', inQueue: true, pageStart: base, pageEnd: base + 4 },
-      { id: leafId, sourceId: source.id, parentId, title: `${title} — Review Unit`, depth: 1, isLeaf: true, studyState: 'unstudied', inQueue: true, pageStart: base, pageEnd: base + 2 }
+      { id: parentId, sourceId: source.id, parentId: null, title: section.title, depth: 0, isLeaf: false, studyState: 'unstudied', inQueue: true, pageStart, pageEnd: pageStart + 4 },
+      { id: leafId, sourceId: source.id, parentId, title: `${section.title} — Review Unit`, depth: 1, isLeaf: true, studyState: 'unstudied', inQueue: true, pageStart, pageEnd: pageStart + 2 }
     ];
   });
   state.data.hierarchy.push(...addedHierarchy);
@@ -104,12 +108,117 @@ function autoParseSource(source) {
   state.view.queue.selectedUnitId = addedUnits[0]?.id || null;
 }
 
+async function parsePdfHeaders(file) {
+  if (!window.pdfjsLib) throw new Error('PDF parser not loaded.');
+  const arrayBuffer = await file.arrayBuffer();
+  const task = window.pdfjsLib.getDocument({ data: arrayBuffer });
+  const pdf = await task.promise;
+  const pageCap = Math.min(pdf.numPages, 25);
+  const candidates = [];
+
+  for (let pageNo = 1; pageNo <= pageCap; pageNo += 1) {
+    const page = await pdf.getPage(pageNo);
+    const text = await page.getTextContent();
+    const items = text.items.map(item => {
+      const y = Math.round(item.transform[5]);
+      const x = item.transform[4];
+      const size = Math.round(Math.abs(item.transform[0]) || item.height || 0);
+      return { str: item.str.trim(), y, x, size };
+    }).filter(item => item.str);
+
+    const grouped = new Map();
+    items.forEach(item => {
+      const bucket = Math.round(item.y / 2) * 2;
+      if (!grouped.has(bucket)) grouped.set(bucket, []);
+      grouped.get(bucket).push(item);
+    });
+
+    const lines = [...grouped.entries()].map(([bucketY, lineItems]) => {
+      const ordered = lineItems.sort((a, b) => a.x - b.x);
+      const textLine = ordered.map(i => i.str).join(' ').replace(/\s+/g, ' ').trim();
+      const avgSize = ordered.reduce((sum, i) => sum + i.size, 0) / ordered.length;
+      return { text: textLine, avgSize, y: bucketY };
+    });
+
+    const sizeValues = lines.map(line => line.avgSize).sort((a, b) => a - b);
+    const medianSize = sizeValues[Math.floor(sizeValues.length / 2)] || 10;
+
+    lines.forEach(line => {
+      const cleaned = line.text.replace(/^[-•\d.\s]+/, '').trim();
+      if (cleaned.length < 4 || cleaned.length > 90) return;
+      const words = cleaned.split(/\s+/);
+      let score = 0;
+      if (/^(chapter|section|part)\s+\d+/i.test(line.text)) score += 3;
+      if (/^\d+(\.\d+)*\s+[A-Za-z]/.test(line.text)) score += 2;
+      if (line.avgSize >= medianSize + 1) score += 2;
+      if (words.length <= 10) score += 1;
+      if (/^[A-Z0-9\s:,-]+$/.test(cleaned) && words.length <= 8) score += 1;
+      if (/^([A-Z][\w'-]+\s){1,9}[A-Z][\w'-]+$/.test(cleaned)) score += 1;
+      if (score >= 3) candidates.push({ title: cleaned, pageStart: pageNo, score });
+    });
+  }
+
+  const unique = [];
+  const seen = new Set();
+  candidates
+    .sort((a, b) => b.score - a.score || a.pageStart - b.pageStart)
+    .forEach(candidate => {
+      const key = candidate.title.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        unique.push(candidate);
+      }
+    });
+
+  return unique.slice(0, 10).sort((a, b) => a.pageStart - b.pageStart);
+}
+
+async function processImportedFile(file) {
+  importDraft.file = file;
+  importDraft.parsedSections = [];
+  const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+  const status = document.getElementById('import-parse-status');
+
+  document.getElementById('import-title').value = file.name;
+  document.getElementById('import-origin').value = file.name;
+  document.getElementById('import-size').value = isPdf ? `${Math.max(1, Math.round(file.size / 1024 / 1024))} MB PDF` : `${Math.max(1, Math.round(file.size / 1024))} KB file`;
+  if (isPdf) document.getElementById('import-type').value = 'pdf';
+
+  if (!isPdf) {
+    status.textContent = 'Loaded file metadata. Header parsing is currently PDF-only.';
+    return;
+  }
+
+  importDraft.parsing = true;
+  status.textContent = 'Parsing PDF headers…';
+  try {
+    const headers = await parsePdfHeaders(file);
+    importDraft.parsedSections = headers.map(h => ({ title: h.title, pageStart: h.pageStart }));
+    status.textContent = headers.length
+      ? `Detected ${headers.length} candidate headers: ${headers.slice(0, 3).map(h => h.title).join(', ')}${headers.length > 3 ? '…' : ''}`
+      : 'No strong headers detected; default sections will be used.';
+  } catch (error) {
+    console.error(error);
+    status.textContent = 'Could not parse PDF headers in-browser. Default sections will be used.';
+  } finally {
+    importDraft.parsing = false;
+  }
+}
+
 function openImportModal() {
+  importDraft.file = null;
+  importDraft.parsedSections = [];
+  importDraft.parsing = false;
+
   const wrap = document.createElement('div');
   wrap.className = 'modal-backdrop';
   wrap.id = 'import-modal-wrap';
   wrap.innerHTML = `<div class="panel modal"><div class="row" style="justify-content:space-between"><h2>Import Source</h2><button class="btn" id="close-import">✕</button></div>
     <div class="col">
+      <label>Drag & drop file (or click to browse)
+        <div id="import-dropzone" class="dropzone" tabindex="0">Drop PDF here for automatic header parsing<input id="import-file" type="file" accept=".pdf,video/*" hidden></div>
+      </label>
+      <p id="import-parse-status" class="small">Add a PDF to auto-detect section headers.</p>
       <label>Title <input id="import-title" placeholder="e.g. Neurobiology Notes.pdf"></label>
       <label>Type <select id="import-type"><option value="pdf">PDF</option><option value="youtube">YouTube</option><option value="local_video">Local Video</option></select></label>
       <label>Size Label <input id="import-size" placeholder="e.g. 240 pages or 90 min"></label>
@@ -118,6 +227,36 @@ function openImportModal() {
       <div class="row"><button class="btn" id="confirm-import">Import</button><button class="btn" id="cancel-import">Cancel</button></div>
     </div></div>`;
   document.body.appendChild(wrap);
+
+  const dropzone = document.getElementById('import-dropzone');
+  const fileInput = document.getElementById('import-file');
+  const onFile = async file => {
+    if (!file) return;
+    await processImportedFile(file);
+  };
+
+  dropzone.onclick = () => fileInput.click();
+  dropzone.onkeydown = e => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      fileInput.click();
+    }
+  };
+  fileInput.onchange = e => onFile(e.target.files?.[0]);
+  ['dragenter', 'dragover'].forEach(type => {
+    dropzone.addEventListener(type, e => {
+      e.preventDefault();
+      dropzone.classList.add('drag-over');
+    });
+  });
+  ['dragleave', 'drop'].forEach(type => {
+    dropzone.addEventListener(type, e => {
+      e.preventDefault();
+      dropzone.classList.remove('drag-over');
+    });
+  });
+  dropzone.addEventListener('drop', e => onFile(e.dataTransfer?.files?.[0]));
+
   document.getElementById('close-import').onclick = closeImportModal;
   document.getElementById('cancel-import').onclick = closeImportModal;
   document.getElementById('confirm-import').onclick = importSourceFromForm;
@@ -129,111 +268,64 @@ function closeImportModal() {
 
 function renderSources() {
   const v = state.view.sources;
-  const d = state.data;
-  const types = {
-    all: () => true,
-    pdf: s => s.sourceType === 'pdf',
-    video: s => ['youtube', 'local_video'].includes(s.sourceType),
-    other: s => !['pdf', 'youtube', 'local_video'].includes(s.sourceType)
-  };
-  const list = d.sources.filter(s => s.title.toLowerCase().includes(v.searchText.toLowerCase()) && types[v.sourceTypeFilter](s));
-  const selected = d.sources.find(s => s.id === v.selectedSourceId) || null;
+  const rows = state.data.sources
+    .filter(s => (!v.searchText || s.title.toLowerCase().includes(v.searchText.toLowerCase()) || s.tags.join(',').toLowerCase().includes(v.searchText.toLowerCase())) && (v.sourceTypeFilter === 'all' || s.sourceType === v.sourceTypeFilter));
 
-  pageRoot.innerHTML = `<section class="sources-grid">
-    <div>
-      <h1>Sources</h1>
-      <div class="toolbar"><input id="src-search" placeholder="Search sources..." value="${v.searchText}"><select id="src-type"><option value="all">All</option><option value="pdf">PDF</option><option value="video">Video</option><option value="other">Other</option></select><button class="btn" id="add-source">+ Add Source</button></div>
-      <div class="panel">${list.length ? `<table class="table"><thead><tr><th>Name & Type</th><th>Size</th><th>Tags</th><th>Total Units</th><th>Reviews</th></tr></thead>
-      <tbody>${list.map(s => `<tr data-source-row="${s.id}" class="${s.id === v.selectedSourceId ? 'selected' : ''}"><td><a href="#" class="source-link" data-open-portal="${s.id}">${s.title}</a><div class="small">${s.sourceType}</div></td><td>${s.sizeLabel}</td><td>${s.tags.map(t => `<span class=chip>${t}</span>`).join(' ') || '<span class="small">—</span>'}</td><td>${s.totalUnits}</td><td>${s.totalReviews}</td></tr>`).join('')}</tbody></table>` : `<div class="empty"><h3>No sources yet</h3><p class="small">Import your first PDF, YouTube link, or local video to generate outline + review units.</p><button class="btn" id="add-source-empty">+ Add Source</button></div>`}</div>
-    </div>
-    <aside class="panel" style="padding:12px">${selected ? `<h2>${selected.title}</h2><div class="small">${selected.sourceType} / ${selected.sizeLabel}</div><div class="chips">${selected.tags.map(t => `<span class=chip>${t}</span>`).join(' ') || '<span class="small">No tags</span>'}</div><hr><div class="row"><div><div>${selected.totalUnits}</div><div class=small>Total Units</div></div><div><div>${selected.totalReviews}</div><div class=small>Total Reviews</div></div></div><p>Avg Time: ${Math.round((selected.averageReviewSeconds || 0) / 60)}m ${(selected.averageReviewSeconds || 0) % 60}s</p><p>Study Time: ${Math.round((selected.totalStudySeconds || 0) / 3600)}h</p><p>Last Updated: ${selected.lastUpdatedAt || '—'}</p><p class=small>${selected.origin}</p><div class="row"><button class="btn" data-open-portal="${selected.id}">Open Source</button><button class="btn">More Actions</button></div>` : `<h2>Source Details</h2><p class="small">Select a source to inspect details, or import a new one.</p>`}</aside>
-  </section>`;
+  pageRoot.innerHTML = `<section class="sources-grid"><div class="panel" style="padding:12px"><div class="toolbar"><input id="src-search" placeholder="Search title/tags" value="${v.searchText}"><select id="src-type"><option value="all">All types</option><option value="pdf">PDF</option><option value="youtube">YouTube</option><option value="local_video">Local Video</option></select><button class="btn" id="add-source">Add Source</button></div><table class="table"><thead><tr><th>Title</th><th>Type</th><th>Size</th><th>Tags</th><th>Units</th><th>Last Update</th></tr></thead><tbody>${rows.map(s => `<tr data-id="${s.id}" class="${s.id === v.selectedSourceId ? 'selected' : ''}"><td><a href="#" class="source-link" data-open="${s.id}">${s.title}</a></td><td>${s.sourceType}</td><td>${s.sizeLabel}</td><td>${s.tags.map(t => `<span class="chip">${t}</span>`).join(' ')}</td><td>${s.totalUnits || 0}</td><td>${s.lastUpdatedAt || '-'}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">No sources yet. Click Add Source to import one.</td></tr>'}</tbody></table></div>
+  <aside class="panel" style="padding:12px"><h3>Source Meta</h3>${(() => {
+    const s = state.data.sources.find(x => x.id === v.selectedSourceId) || rows[0];
+    if (!s) return '<p class="small">Select a source to view metadata and open its portal.</p>';
+    return `<div class="col"><div><strong>${s.title}</strong></div><div class="small">Origin: ${s.origin}</div><div class="chips">${s.tags.map(t => `<span class="chip">${t}</span>`).join(' ') || '<span class="small">No tags</span>'}</div><button class="btn" id="open-portal">Open Source Portal</button></div>`;
+  })()}</aside></section>`;
 
-  document.getElementById('src-search').oninput = e => { v.searchText = e.target.value; renderSources(); save(); };
   document.getElementById('src-type').value = v.sourceTypeFilter;
+  document.getElementById('src-search').oninput = e => { v.searchText = e.target.value; renderSources(); save(); };
   document.getElementById('src-type').onchange = e => { v.sourceTypeFilter = e.target.value; renderSources(); save(); };
   document.getElementById('add-source').onclick = openImportModal;
-  document.getElementById('add-source-empty')?.addEventListener('click', openImportModal);
-
-  document.querySelectorAll('[data-source-row]').forEach(r => {
-    r.onclick = e => {
-      if (e.target.closest('[data-open-portal]')) return;
-      v.selectedSourceId = r.dataset.sourceRow;
-      renderSources();
-      save();
-    };
-    r.oncontextmenu = e => openContextMenu(e, r.dataset.sourceRow);
-  });
-
-  document.querySelectorAll('[data-open-portal]').forEach(a => a.onclick = e => {
+  document.querySelectorAll('tr[data-id]').forEach(tr => tr.onclick = () => { v.selectedSourceId = tr.dataset.id; renderSources(); save(); });
+  document.querySelectorAll('[data-open]').forEach(a => a.onclick = e => {
     e.preventDefault();
-    state.view.portal.sourceId = a.dataset.openPortal;
+    const id = a.dataset.open;
+    v.selectedSourceId = id;
+    state.view.portal.sourceId = id;
     state.view.page = 'portal';
     render();
     save();
   });
-}
-
-function openContextMenu(e, sourceId) {
-  e.preventDefault();
-  const menu = document.getElementById('context-menu');
-  const source = state.data.sources.find(s => s.id === sourceId);
-  if (!source) return;
-  menu.classList.remove('hidden');
-  menu.style.left = `${e.clientX}px`;
-  menu.style.top = `${e.clientY}px`;
-  const items = ['Open Source', 'Rename', 'Priority: High', 'Priority: Medium', 'Priority: Low', 'Priority: No Priority', 'Download', 'Remove Source'];
-  menu.innerHTML = items.map(label => `<div class="item" data-item="${label}">${label}${label === `Priority: ${source.priority[0].toUpperCase()}${source.priority.slice(1)}` ? ' ✓' : ''}</div>`).join('');
-
-  [...menu.querySelectorAll('.item')].forEach((el, i) => el.onclick = () => {
-    const actions = [
-      () => { state.view.portal.sourceId = sourceId; state.view.page = 'portal'; },
-      () => { const n = prompt('New name', source.title); if (n) source.title = n; },
-      () => source.priority = 'high', () => source.priority = 'medium', () => source.priority = 'low', () => source.priority = 'none',
-      () => alert('Download queued'),
-      () => {
-        state.data.sources = state.data.sources.filter(s => s.id !== sourceId);
-        state.data.hierarchy = state.data.hierarchy.filter(h => h.sourceId !== sourceId);
-        state.data.units = state.data.units.filter(u => u.sourceId !== sourceId);
-        if (state.view.sources.selectedSourceId === sourceId) state.view.sources.selectedSourceId = state.data.sources[0]?.id || null;
-      }
-    ];
-    actions[i]();
-    menu.classList.add('hidden');
+  const open = document.getElementById('open-portal');
+  if (open) open.onclick = () => {
+    const id = (state.data.sources.find(x => x.id === v.selectedSourceId) || rows[0])?.id;
+    if (!id) return;
+    state.view.portal.sourceId = id;
+    state.view.page = 'portal';
     render();
     save();
-  });
-  window.onclick = () => menu.classList.add('hidden');
+  };
 }
 
 function renderPortal() {
-  const source = state.data.sources.find(s => s.id === state.view.portal.sourceId);
+  const v = state.view.portal;
+  const source = state.data.sources.find(s => s.id === v.sourceId) || state.data.sources[0] || null;
   if (!source) {
-    pageRoot.innerHTML = `<section class="panel" style="padding:16px"><h1>Source Portal</h1><p class="small">No source is selected. Go to Sources and import one first.</p><button class="btn" id="go-sources">Go to Sources</button></section>`;
-    document.getElementById('go-sources').onclick = () => { state.view.page = 'sources'; render(); save(); };
+    pageRoot.innerHTML = `<section class="panel" style="padding:16px"><h2>Source Portal</h2><p class="small">No source loaded. Import from Sources first.</p></section>`;
     return;
   }
 
-  const v = state.view.portal;
-  const items = state.data.hierarchy.filter(h => h.sourceId === source.id && h.title.toLowerCase().includes(v.outlineSearchText.toLowerCase()));
-  const selected = items.find(i => i.id === v.selectedHierarchyItemId) || items[0] || null;
+  const outline = state.data.hierarchy.filter(h => h.sourceId === source.id);
+  const filtered = outline.filter(h => !v.outlineSearchText || h.title.toLowerCase().includes(v.outlineSearchText.toLowerCase()));
+  const selected = outline.find(h => h.id === v.selectedHierarchyItemId) || outline[0] || null;
+  if (!v.selectedHierarchyItemId && selected) v.selectedHierarchyItemId = selected.id;
 
-  pageRoot.innerHTML = `<div class="portal">
-    <aside class="panel col" style="padding:10px"><div class="row"><button class="btn" id="back-sources">← Sources</button></div><input id="outline-search" placeholder="Search outline..." value="${v.outlineSearchText}"><div class="outline-list panel">${items.length ? items.map(i => {
-      const fills = i.studyState === 'mastered' ? 2 : i.studyState === 'started' ? 1 : 0;
-      return `<div class="outline-item ${selected?.id === i.id ? 'selected' : ''}" data-item="${i.id}"><div class="indent" style="--depth:${i.depth}"><span>${i.title}</span></div><div class="bars" data-toggle="${i.id}">${[0, 1].map(idx => `<span class="bar ${idx < fills ? `fill ${i.inQueue ? 'inq' : 'outq'}` : ''}"></span>`).join('')}</div></div>`;
-    }).join('') : '<div class="small" style="padding:10px">No parsed outline items yet.</div>'}</div></aside>
-    <section class="panel viewer"><div class="row"><strong>${source.title}</strong><span class="small">Page ${v.viewerPage || selected?.pageStart || 1} • Zoom ${v.viewerZoom}%</span><button class="btn" id="zoom-in">+</button><button class="btn" id="zoom-out">-</button></div><div class="viewer-doc"><h1>${selected?.title || 'No item selected'}</h1><p>Embedded viewer placeholder for ${source.sourceType.toUpperCase()} content.</p><p>Selection maps to ${source.sourceType === 'pdf' ? `page ${selected?.pageStart || 1}-${selected?.pageEnd || 1}` : `time ${selected?.timeStartSec || 0}s`}.</p></div></section>
-    <aside class="panel" style="padding:10px"><h2>${source.title}</h2><div class="small">${source.sourceType} • ${source.sizeLabel}</div><div class="chips">${source.tags.map(t => `<span class=chip>${t}</span>`).join(' ')}</div><hr><div class="row"><div>${source.totalUnits}<div class="small">Total Units</div></div><div>${source.totalReviews}<div class="small">Reviews</div></div></div><p>Avg Review: ${Math.round((source.averageReviewSeconds || 0) / 60)}m</p><p>Total Study: ${Math.round((source.totalStudySeconds || 0) / 3600)}h</p><p>Updated: ${source.lastUpdatedAt}</p></aside>
-  </div>`;
+  pageRoot.innerHTML = `<div class="portal"><aside class="panel"><div style="padding:10px"><h3>${source.title}</h3><input id="outline-search" placeholder="Search outline" value="${v.outlineSearchText}"></div><div class="outline-list">${filtered.map(item => `<div class="outline-item ${item.id === selected?.id ? 'selected' : ''}" data-item="${item.id}"><div class="indent" style="--depth:${item.depth}">${item.isLeaf ? '📄' : '📁'} ${item.title}</div><div class="bars" title="toggle queue" data-toggle="${item.id}"><span class="bar ${item.inQueue ? 'fill inq' : ''}"></span><span class="bar ${item.inQueue ? 'fill inq' : ''}"></span><span class="bar ${item.inQueue ? 'fill inq' : ''}"></span></div></div>`).join('') || '<p class="small" style="padding:8px">No outline items.</p>'}</div></aside>
+  <section class="panel viewer"><div class="row" style="justify-content:space-between"><h3>Viewer</h3><div class="controls"><button class="btn" id="zoom-out">-</button><span>${v.viewerZoom || 120}%</span><button class="btn" id="zoom-in">+</button></div></div><div class="small">${source.sourceType === 'pdf' ? `PDF Page ${selected?.pageStart || v.viewerPage}` : `Time ${selected?.timeStartSec || 0}s`}</div><div class="viewer-doc" style="font-size:${(v.viewerZoom || 120) / 100}em"><h2>${selected?.title || 'No item selected'}</h2><p>Simulated embedded source viewer region. In production this panel maps to actual PDF/video location and allows highlighting.</p></div></section>
+  <aside class="panel" style="padding:12px"><h3>Unit Meta</h3><div class="small">Source Type: ${source.sourceType}</div><div class="small">Priority: ${source.priority}</div><div class="small">Units: ${source.totalUnits}</div><div class="small">Queue On/Off via bars in outline.</div></aside></div>`;
 
-  document.getElementById('back-sources').onclick = () => { state.view.page = 'sources'; render(); save(); };
   document.getElementById('outline-search').oninput = e => { v.outlineSearchText = e.target.value; renderPortal(); save(); };
-  document.querySelectorAll('[data-item]').forEach(el => el.onclick = e => {
-    if (e.target.closest('[data-toggle]')) return;
+  document.querySelectorAll('[data-item]').forEach(el => el.onclick = () => {
     v.selectedHierarchyItemId = el.dataset.item;
-    const i = state.data.hierarchy.find(x => x.id === el.dataset.item);
-    if (i?.pageStart) v.viewerPage = i.pageStart;
+    const item = outline.find(x => x.id === v.selectedHierarchyItemId);
+    const unit = state.data.units.find(u => u.sourceId === source.id && u.title.startsWith(item.title));
+    if (unit) state.view.queue.selectedUnitId = unit.id;
     renderPortal();
     save();
   });
@@ -258,7 +350,7 @@ function renderQueue() {
   if (!v.selectedUnitId && u) v.selectedUnitId = u.id;
 
   pageRoot.innerHTML = `<div class="queue"><aside class="panel queue-list"><h2>Study Queue</h2>${units.length ? units.map(x => `<div class="queue-item ${x.id === u?.id ? 'active' : ''}" data-unit="${x.id}"><strong>${x.title}</strong><div class="small">${x.sourceTitle} • ${x.sizeLabel}</div><div>${x.retentionScore}%</div></div>`).join('') : '<p class="small">No units in queue yet. Import a source and keep units enabled in queue from Source Portal.</p>'}</aside>
-  <section class="col"><div class="panel" style="padding:12px"><div class="row" style="justify-content:space-between"><div><h1>${u?.title || 'No unit selected'}</h1><div class="small">${u?.sourceTitle || '—'} • ${u?.fullPath?.join(' › ') || ''}</div></div><button class="btn" id="open-history" ${u ? '' : 'disabled'}>Review History</button></div><div class="row"><div>Last Reviewed<div>${u?.lastReviewedAt || '—'}</div></div><div>Total Reviews<div>${u?.totalReviews || 0}</div></div><div>Retention<div>${u?.retentionScore || 0}%</div></div></div></div>
+  <section class="col"><div class="panel" style="padding:12px"><h3>${u?.title || 'No unit selected'}</h3><div class="small">${u ? `${u.sourceTitle} • ${u.pageStart ? `pp.${u.pageStart}-${u.pageEnd}` : `${u.timeStartSec || 0}-${u.timeEndSec || 0}s`}` : 'Select a unit to begin.'}</div><div class="row"><button class="btn" id="open-history" ${u ? '' : 'disabled'}>Review History</button><div class="small">Retention<div>${u?.retentionScore || 0}%</div></div></div></div>
   <div class="panel" style="padding:12px"><div class="controls"><strong id="timer">${format(v.elapsedSec)}</strong><button class="btn" id="start-stop" ${u ? '' : 'disabled'}>${v.timerRunning ? 'Pause' : 'Start'}</button><button class="btn" id="restart" ${u ? '' : 'disabled'}>Restart</button><button class="btn outcome" data-outcome="easy" ${u ? '' : 'disabled'}>Easy</button><button class="btn outcome" data-outcome="with_effort" ${u ? '' : 'disabled'}>With Effort</button><button class="btn outcome" data-outcome="hard" ${u ? '' : 'disabled'}>Hard</button><button class="btn outcome" data-outcome="skip" ${u ? '' : 'disabled'}>Skip</button></div><div class="row"><textarea id="pre-note" rows="3" placeholder="Pre-recall note" style="flex:1">${v.preRecallNote || ''}</textarea><textarea id="post-note" rows="3" placeholder="Post-recall note" style="flex:1">${v.postRecallNote || ''}</textarea></div></div>
   <div class="panel viewer" style="min-height:220px"><div class="small">Embedded ${u?.sourceType || 'source'} viewer @ ${u?.pageStart ? `page ${u.pageStart}` : `${u?.timeStartSec || 0}s`}</div><div class="viewer-doc"><h3>${u?.title || 'No unit loaded'}</h3><p>${u ? 'Context viewer opens at mapped location for quick review.' : 'Import and parse sources first to see review context here.'}</p></div></div></section></div>`;
 

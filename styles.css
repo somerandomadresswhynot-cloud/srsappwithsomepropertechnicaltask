@@ -69,3 +69,19 @@ input, select, textarea { background:#12172f; color:var(--text); border:1px soli
 .empty { padding: 24px; text-align: center; }
 label { display:flex; flex-direction:column; gap:6px; font-size:13px; color:var(--muted); }
 button:disabled { opacity:.5; cursor:not-allowed; }
+
+.dropzone {
+  border: 2px dashed #4f5f9f;
+  border-radius: 10px;
+  padding: 18px;
+  color: var(--muted);
+  text-align: center;
+  background: #141a33;
+  cursor: pointer;
+}
+
+.dropzone.drag-over {
+  border-color: var(--accent);
+  background: #1d2854;
+  color: #dce7ff;
+}
