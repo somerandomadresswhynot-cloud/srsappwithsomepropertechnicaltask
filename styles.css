@@ -48,7 +48,17 @@ input, select, textarea { background:#12172f; color:var(--text); border:1px soli
 .bars.queue-on .bar,
 .bar.queue-on { box-shadow: 0 0 6px #70a0ffb0; }
 .viewer { padding:12px; display:flex; flex-direction:column; }
-.viewer-doc { margin-top:8px; min-height:380px; background:#f8f8fc; color:#1c2440; border-radius:8px; padding:20px; }
+
+.viewer-doc { margin-top:8px; min-height:380px; background:#f8f8fc; color:#1c2440; border-radius:8px; padding:12px; overflow:auto; }
+.viewer-location { font-size:12px; color:#4c587f; margin-bottom:8px; }
+.viewer-fallback { padding:14px; border:1px dashed #8892b5; border-radius:8px; background:#eef1fb; }
+.viewer-fallback h4 { margin:0 0 8px 0; }
+.viewer-fallback p { margin:0; }
+.pdf-page-wrap { position:relative; background:#fff; border:1px solid #d8ddf3; border-radius:6px; overflow:hidden; }
+.pdf-canvas { display:block; width:100%; height:auto; }
+.pdf-text-layer { position:absolute; inset:0; line-height:1; }
+.video-player, .video-frame { width:100%; min-height:300px; border:0; border-radius:8px; background:#000; }
+
 
 /* Queue */
 .queue { display:grid; grid-template-columns: 300px 1fr; gap:14px; }
