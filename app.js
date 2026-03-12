@@ -140,8 +140,9 @@ async function parsePdfHeaders(file) {
   const arrayBuffer = await file.arrayBuffer();
   const task = window.pdfjsLib.getDocument({ data: arrayBuffer });
   const pdf = await task.promise;
-  const pageCap = Math.min(pdf.numPages, 25);
+  const pageCap = Math.min(pdf.numPages, 40);
   const candidates = [];
+  const tocCandidates = [];
 
   for (let pageNo = 1; pageNo <= pageCap; pageNo += 1) {
     const page = await pdf.getPage(pageNo);
@@ -164,11 +165,15 @@ async function parsePdfHeaders(file) {
       const ordered = lineItems.sort((a, b) => a.x - b.x);
       const textLine = ordered.map(i => i.str).join(' ').replace(/\s+/g, ' ').trim();
       const avgSize = ordered.reduce((sum, i) => sum + i.size, 0) / ordered.length;
-      return { text: textLine, avgSize, y: bucketY };
+      const minX = Math.min(...ordered.map(i => i.x));
+      return { text: textLine, avgSize, y: bucketY, minX };
     });
 
     const sizeValues = lines.map(line => line.avgSize).sort((a, b) => a - b);
     const medianSize = sizeValues[Math.floor(sizeValues.length / 2)] || 10;
+
+    const tocEntries = extractTocEntries(lines);
+    if (tocEntries.length >= 6) tocCandidates.push(...tocEntries);
 
     lines.forEach(line => {
       const cleaned = line.text.replace(/^[-•\d.\s]+/, '').trim();
@@ -187,22 +192,59 @@ async function parsePdfHeaders(file) {
     });
   }
 
-  const unique = [];
-  const seen = new Set();
-  candidates
-    .sort((a, b) => b.score - a.score || a.pageStart - b.pageStart)
-    .forEach(candidate => {
-      const key = candidate.title.toLowerCase();
-      if (!seen.has(key)) {
-        seen.add(key);
-        unique.push(candidate);
-      }
-    });
+  if (tocCandidates.length >= 8) {
+    const dedup = dedupeCandidates(tocCandidates, c => `${c.title.toLowerCase()}|${c.pageStart}`);
+    return dedup
+      .sort((a, b) => a.pageStart - b.pageStart || a.level - b.level)
+      .slice(0, 80);
+  }
+
+  const unique = dedupeCandidates(
+    candidates.sort((a, b) => b.score - a.score || a.pageStart - b.pageStart),
+    c => c.title.toLowerCase()
+  );
 
   return unique.slice(0, 24).sort((a, b) => a.pageStart - b.pageStart || a.level - b.level);
 }
 
-function inferHeaderLevel(title, avgSize, medianSize) {
+function extractTocEntries(lines) {
+  const entryRegex = /^(.*?)\s(?:\.{2,}\s*|\s)(\d{1,4})$/;
+  const tocLines = lines
+    .map(line => {
+      const match = line.text.match(entryRegex);
+      if (!match) return null;
+      const rawTitle = match[1].replace(/[•·]+/g, ' ').replace(/\s+/g, ' ').trim();
+      const pageStart = Number(match[2]);
+      if (!rawTitle || rawTitle.length < 3 || rawTitle.length > 120 || Number.isNaN(pageStart)) return null;
+      if (/^(index|references|bibliography)$/i.test(rawTitle)) return null;
+      return { title: rawTitle, pageStart, minX: line.minX };
+    })
+    .filter(Boolean);
+
+  if (!tocLines.length) return [];
+  const baseX = Math.min(...tocLines.map(line => line.minX));
+
+  return tocLines.map(entry => ({
+    title: entry.title,
+    pageStart: entry.pageStart,
+    score: 10,
+    level: inferHeaderLevel(entry.title, 0, 0, entry.minX - baseX)
+  }));
+}
+
+function dedupeCandidates(list, keyFn) {
+  const unique = [];
+  const seen = new Set();
+  list.forEach(candidate => {
+    const key = keyFn(candidate);
+    if (seen.has(key)) return;
+    seen.add(key);
+    unique.push(candidate);
+  });
+  return unique;
+}
+
+function inferHeaderLevel(title, avgSize, medianSize, indentOffset = 0) {
   if (/^(chapter|part)\s+/i.test(title)) return 0;
   if (/^section\s+/i.test(title)) return 1;
   if (/^subsection\s+/i.test(title)) return 2;
@@ -211,6 +253,9 @@ function inferHeaderLevel(title, avgSize, medianSize) {
     const parts = numberingMatch[1].split('.').length;
     return Math.max(0, Math.min(2, parts - 1));
   }
+  if (indentOffset > 28) return 2;
+  if (indentOffset > 12) return 1;
+  if (medianSize <= 0) return 0;
   if (avgSize >= medianSize + 3) return 0;
   if (avgSize >= medianSize + 1) return 1;
   return 2;
