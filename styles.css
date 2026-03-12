@@ -1,0 +1,78 @@
+:root {
+  --bg: #171a2b;
+  --panel: #21253d;
+  --panel-2: #262b46;
+  --text: #e8ebff;
+  --muted: #a2a9d0;
+  --accent: #4e7dff;
+  --ok: #4fbf7a;
+  --warn: #d9a24a;
+  --bad: #d16363;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  color: var(--text);
+  background: radial-gradient(circle at top right, #23284b, var(--bg));
+}
+button, input, select, textarea {
+  font: inherit;
+  color: inherit;
+  background: #30365a;
+  border: 1px solid #3c4268;
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+button:hover { filter: brightness(1.08); cursor: pointer; }
+.app-shell { min-height: 100vh; display: flex; flex-direction: column; }
+.top-nav {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 20px; border-bottom: 1px solid #33395b;
+}
+.top-nav .brand { font-weight: 700; margin-right: 12px; }
+.top-nav button.active { background: #3c4d91; border-color: #5c6ebb; }
+.page { padding: 16px 20px; }
+.grid-2 { display: grid; grid-template-columns: 1.15fr 0.85fr; gap: 16px; }
+.grid-3 { display: grid; grid-template-columns: 290px 1fr 320px; gap: 14px; }
+.panel { background: linear-gradient(180deg, var(--panel), var(--panel-2)); border: 1px solid #353b5f; border-radius: 12px; padding: 12px; }
+.muted { color: var(--muted); }
+.list { display: flex; flex-direction: column; gap: 8px; max-height: 70vh; overflow: auto; }
+.list-item { border: 1px solid #3b4267; border-radius: 10px; padding: 10px; background: #262b47; display: flex; justify-content: space-between; align-items: center; }
+.list-item.selected { outline: 2px solid #5370e8; }
+.row { display: flex; gap: 10px; align-items: center; }
+.col { display: flex; flex-direction: column; gap: 10px; }
+.badge { display: inline-block; border-radius: 999px; background: #3a4166; padding: 3px 8px; font-size: 12px; margin: 0 4px 4px 0; }
+.table { width: 100%; border-collapse: collapse; }
+.table th, .table td { border-bottom: 1px solid #363c62; padding: 8px; text-align: left; }
+.table tr.selected { background: #2e355a; }
+.title-link { color: #cdd6ff; text-decoration: none; }
+.title-link:hover { color: #fff; text-decoration: underline; text-shadow: 0 0 10px rgba(130,160,255,.5); }
+.viewer { min-height: 380px; background: #111528; border: 1px solid #343b63; border-radius: 10px; display: flex; align-items: center; justify-content: center; color: #b6bfef; }
+.toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.two-bar {
+  width: 22px; height: 14px; display: inline-grid; grid-template-columns: 1fr 1fr; gap: 4px;
+  border: 1px solid #59618b; border-radius: 4px; padding: 2px; cursor: pointer;
+}
+.two-bar span { border-radius: 2px; background: #32395f; }
+.two-bar.in-queue span.filled { background: #4e7dff; }
+.two-bar.not-queue span.filled { background: #848cae; }
+.split { display: flex; justify-content: space-between; gap: 8px; }
+.outcome button { border-radius: 999px; }
+.outcome .easy { background: rgba(79,191,122,.2); border-color: #4fbf7a; }
+.outcome .with_effort { background: rgba(217,162,74,.2); border-color: #d9a24a; }
+.outcome .hard { background: rgba(209,99,99,.2); border-color: #d16363; }
+.outcome .skip { background: rgba(150,152,182,.2); border-color: #9aa0c2; }
+.modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: grid; place-items: center; }
+.modal { width: min(1000px, 95vw); max-height: 85vh; overflow: auto; }
+.small { font-size: 12px; }
+.right { text-align: right; }
+textarea { width: 100%; min-height: 80px; }
+.controls-row { display: flex; align-items: center; gap: 8px; }
+.search { width: 100%; }
+.tree-row { display:flex; justify-content: space-between; align-items:center; padding: 6px; border-radius: 8px; }
+.tree-row.selected { background: #32395f; }
+.indent-0{padding-left:0}.indent-1{padding-left:12px}.indent-2{padding-left:24px}.indent-3{padding-left:36px}
+.context-menu { position: fixed; background: #2a3050; border:1px solid #4a5179; border-radius:8px; padding:6px; z-index:20; min-width: 180px; }
+.context-menu button { width:100%; text-align:left; margin-bottom:4px; }
