@@ -588,26 +588,37 @@ function renderPortal() {
     renderPortal();
     save();
   });
-  document.querySelectorAll('[data-toggle]').forEach(el => el.onclick = e => {
+
+  const onToggleQueue = e => {
     e.stopPropagation();
-    const i = state.data.hierarchy.find(x => x.id === el.dataset.toggle);
+    const toggleId = e.currentTarget?.dataset.toggle;
+    const i = state.data.hierarchy.find(x => x.id === toggleId);
     if (!i) return;
+
     const nextState = !i.inQueue;
-    const affected = new Set([i.id, ...getDescendantIds(i.id, state.data.hierarchy.filter(x => x.sourceId === i.sourceId))]);
+    const related = state.data.hierarchy.filter(x => x.sourceId === i.sourceId);
+    const affected = new Set([i.id, ...getDescendantIds(i.id, related)]);
+
     state.data.hierarchy.forEach(node => {
       if (affected.has(node.id)) node.inQueue = nextState;
     });
     state.data.units.forEach(unit => {
       if (affected.has(unit.hierarchyId)) unit.inQueue = nextState;
     });
+
     affected.forEach(id => {
       const target = document.querySelector(`[data-item="${id}"] .bars`);
       const node = state.data.hierarchy.find(x => x.id === id);
-      if (target && node) target.outerHTML = renderQueueBars(node);
+      if (!target || !node) return;
+      target.outerHTML = renderQueueBars(node);
+      const replacement = document.querySelector(`[data-item="${id}"] .bars`);
+      if (replacement) replacement.onclick = onToggleQueue;
     });
-    document.querySelectorAll('[data-toggle]').forEach(node => node.onclick = el.onclick);
+
     save();
-  });
+  };
+
+  document.querySelectorAll('[data-toggle]').forEach(el => el.onclick = onToggleQueue);
   document.getElementById('zoom-in').onclick = () => { v.viewerZoom = Math.min(200, (v.viewerZoom || 120) + 10); renderPortal(); save(); };
   document.getElementById('zoom-out').onclick = () => { v.viewerZoom = Math.max(50, (v.viewerZoom || 120) - 10); renderPortal(); save(); };
 }
