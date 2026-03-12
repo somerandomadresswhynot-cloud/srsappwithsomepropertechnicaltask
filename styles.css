@@ -36,7 +36,7 @@ input, select, textarea { background:#12172f; color:var(--text); border:1px soli
 .outline-list { max-height:70vh; overflow:auto; padding:8px; }
 .outline-tools { display:flex; align-items:center; justify-content:space-between; padding:0 10px 6px; }
 .queue-master { width:14px; height:14px; border-radius:50%; border:1px solid var(--accent); background:var(--accent); cursor:pointer; }
-.queue-master.queue-off { box-shadow: 0 0 8px #70a0ffcc; }
+.queue-master.queue-on { box-shadow: 0 0 8px #70a0ffcc; }
 
 .outline-item { display:flex; align-items:center; justify-content:space-between; padding:6px; border-radius:8px; cursor:pointer; }
 .outline-item:hover { background:#27305a; }
@@ -45,8 +45,8 @@ input, select, textarea { background:#12172f; color:var(--text); border:1px soli
 .bars { display:flex; gap:3px; cursor:pointer; padding:2px; border-radius:8px; }
 .bar { width:7px; height:16px; border-radius:4px; border:1px solid var(--accent); background:transparent; }
 .bar.fill { background:var(--accent); }
-.bars.queue-off .bar,
-.bar.queue-off { box-shadow: 0 0 6px #70a0ffb0; }
+.bars.queue-on .bar,
+.bar.queue-on { box-shadow: 0 0 6px #70a0ffb0; }
 .viewer { padding:12px; display:flex; flex-direction:column; }
 .viewer-doc { margin-top:8px; min-height:380px; background:#f8f8fc; color:#1c2440; border-radius:8px; padding:20px; }
 
