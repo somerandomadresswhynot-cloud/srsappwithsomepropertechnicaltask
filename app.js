@@ -24,11 +24,26 @@ function hydratePersistedState(persistedState) {
   const data = persistedState.data && typeof persistedState.data === 'object' ? persistedState.data : {};
   const view = persistedState.view && typeof persistedState.view === 'object' ? persistedState.view : {};
 
+  const sources = Array.isArray(data.sources) ? data.sources.map(normalizePersistedSource) : [];
+  const hierarchy = Array.isArray(data.hierarchy) ? data.hierarchy : [];
+  const units = Array.isArray(data.units)
+    ? data.units.map(unit => normalizePersistedUnit(unit, sources, hierarchy))
+    : [];
+  const unitsBySource = new Map();
+  units.forEach(unit => {
+    if (!unitsBySource.has(unit.sourceId)) unitsBySource.set(unit.sourceId, []);
+    unitsBySource.get(unit.sourceId).push(unit);
+  });
+  const hydratedSources = sources.map(source => ({
+    ...source,
+    ...inferSourceMetadata(source, unitsBySource.get(source.id) || [])
+  }));
+
   return {
     data: {
-      sources: Array.isArray(data.sources) ? data.sources : [],
-      hierarchy: Array.isArray(data.hierarchy) ? data.hierarchy : [],
-      units: Array.isArray(data.units) ? data.units : [],
+      sources: hydratedSources,
+      hierarchy,
+      units,
       reviews: Array.isArray(data.reviews) ? data.reviews : [],
       revisions: Array.isArray(data.revisions) ? data.revisions : []
     },
@@ -39,6 +54,87 @@ function hydratePersistedState(persistedState) {
       queue: { ...base.view.queue, ...(view.queue || {}) }
     }
   };
+}
+
+function normalizePersistedSource(source) {
+  if (!source || typeof source !== 'object') return source;
+  return {
+    ...source,
+    origin: source.origin || source.originRef || '(unknown)',
+    originRef: source.originRef || source.origin || '(unknown)',
+    totalPages: Number.isFinite(source.totalPages) ? source.totalPages : null,
+    durationSec: Number.isFinite(source.durationSec) ? source.durationSec : null
+  };
+}
+
+function normalizePersistedUnit(unit, sources, hierarchy) {
+  if (!unit || typeof unit !== 'object') return unit;
+
+  const source = sources.find(item => item.id === unit.sourceId);
+  const hierarchyItem = hierarchy.find(item => item.id === unit.hierarchyId);
+  const inferredSourceType = unit.sourceType || source?.sourceType || 'doc';
+  const normalized = { ...unit, sourceType: inferredSourceType };
+
+  if (inferredSourceType === 'pdf') {
+    const start = Number.isFinite(unit.pageStart) ? unit.pageStart : hierarchyItem?.pageStart;
+    const end = Number.isFinite(unit.pageEnd) ? unit.pageEnd : hierarchyItem?.pageEnd;
+    normalized.pageStart = Number.isFinite(start) ? start : null;
+    normalized.pageEnd = Number.isFinite(end) ? Math.max(end, normalized.pageStart || end) : normalized.pageStart;
+  } else if (inferredSourceType === 'youtube' || inferredSourceType === 'local_video' || inferredSourceType === 'video') {
+    normalized.timeStartSec = Number.isFinite(unit.timeStartSec) ? unit.timeStartSec : null;
+    normalized.timeEndSec = Number.isFinite(unit.timeEndSec) ? Math.max(unit.timeEndSec, normalized.timeStartSec || unit.timeEndSec) : normalized.timeStartSec;
+  } else {
+    normalized.locatorType = typeof unit.locatorType === 'string' && unit.locatorType.trim() ? unit.locatorType : 'section';
+    normalized.locatorStart = unit.locatorStart ?? unit.pageStart ?? null;
+    normalized.locatorEnd = unit.locatorEnd ?? unit.pageEnd ?? normalized.locatorStart;
+  }
+
+  if (!normalized.sizeLabel || /^\s*$/.test(normalized.sizeLabel)) {
+    normalized.sizeLabel = buildUnitSizeLabel(normalized);
+  }
+
+  return normalized;
+}
+
+function buildUnitSizeLabel(unit) {
+  if (Number.isFinite(unit.pageStart) && Number.isFinite(unit.pageEnd)) {
+    const pages = Math.max(1, unit.pageEnd - unit.pageStart + 1);
+    return `${pages} page${pages === 1 ? '' : 's'}`;
+  }
+  if (Number.isFinite(unit.timeStartSec) && Number.isFinite(unit.timeEndSec)) {
+    const seconds = Math.max(1, unit.timeEndSec - unit.timeStartSec);
+    if (seconds >= 60) {
+      const mins = (seconds / 60).toFixed(1).replace(/\.0$/, '');
+      return `${mins} min`;
+    }
+    return `${seconds}s`;
+  }
+  if (unit.locatorStart != null && unit.locatorEnd != null) {
+    const type = unit.locatorType || 'section';
+    return unit.locatorStart === unit.locatorEnd
+      ? `${type} ${unit.locatorStart}`
+      : `${type} ${unit.locatorStart}-${unit.locatorEnd}`;
+  }
+  return 'Span unknown';
+}
+
+function inferSourceMetadata(source, units = []) {
+  const metadata = {
+    origin: source.origin || source.originRef || '(unknown)',
+    originRef: source.originRef || source.origin || '(unknown)',
+    totalPages: null,
+    durationSec: null
+  };
+
+  if (source.sourceType === 'pdf') {
+    const maxPage = Math.max(...units.map(u => Number.isFinite(u.pageEnd) ? u.pageEnd : (Number.isFinite(u.pageStart) ? u.pageStart : 0)), 0);
+    metadata.totalPages = maxPage > 0 ? maxPage : null;
+  } else if (['youtube', 'local_video', 'video'].includes(source.sourceType)) {
+    const maxTime = Math.max(...units.map(u => Number.isFinite(u.timeEndSec) ? u.timeEndSec : (Number.isFinite(u.timeStartSec) ? u.timeStartSec : 0)), 0);
+    metadata.durationSec = maxTime > 0 ? maxTime : null;
+  }
+
+  return metadata;
 }
 
 
@@ -100,7 +196,10 @@ function importSourceFromForm() {
     totalStudySeconds: 0,
     lastUpdatedAt: new Date().toISOString().slice(0, 10),
     priority: 'none',
-    origin: origin || '(user imported)'
+    origin: origin || '(user imported)',
+    originRef: origin || '(user imported)',
+    totalPages: null,
+    durationSec: null
   };
 
   state.data.sources.push(source);
@@ -124,9 +223,15 @@ function autoParseSource(source, parsedSections = []) {
       { title: 'Chapter 2 Summary', pageStart: 13, level: 0 }
     ];
 
-  const normalized = sections.map((section, idx) => ({
+  const normalized = sections.map((section) => ({
     title: section.title,
-    pageStart: section.pageStart || idx * 5 + 1,
+    pageStart: Number.isFinite(section.pageStart) ? section.pageStart : null,
+    pageEnd: Number.isFinite(section.pageEnd) ? section.pageEnd : null,
+    timeStartSec: Number.isFinite(section.timeStartSec) ? section.timeStartSec : null,
+    timeEndSec: Number.isFinite(section.timeEndSec) ? section.timeEndSec : null,
+    locatorStart: section.locatorStart ?? null,
+    locatorEnd: section.locatorEnd ?? null,
+    locatorType: typeof section.locatorType === 'string' && section.locatorType.trim() ? section.locatorType : null,
     level: Number.isInteger(section.level) ? Math.max(0, Math.min(6, section.level)) : 0
   }));
 
@@ -136,7 +241,17 @@ function autoParseSource(source, parsedSections = []) {
     const parentId = parentStack[parentStack.length - 1] || null;
     const id = crypto.randomUUID();
     parentStack.push(id);
-    const pageEnd = normalized[idx + 1]?.pageStart ? Math.max(node.pageStart, normalized[idx + 1].pageStart - 1) : node.pageStart + 3;
+    const next = normalized[idx + 1];
+    const pageEnd = Number.isFinite(node.pageEnd)
+      ? Math.max(node.pageEnd, node.pageStart || node.pageEnd)
+      : (Number.isFinite(node.pageStart) && Number.isFinite(next?.pageStart)
+        ? Math.max(node.pageStart, next.pageStart - 1)
+        : (Number.isFinite(node.pageStart) ? node.pageStart : null));
+    const timeEndSec = Number.isFinite(node.timeEndSec)
+      ? Math.max(node.timeEndSec, node.timeStartSec || node.timeEndSec)
+      : (Number.isFinite(node.timeStartSec) && Number.isFinite(next?.timeStartSec)
+        ? Math.max(node.timeStartSec, next.timeStartSec)
+        : (Number.isFinite(node.timeStartSec) ? node.timeStartSec : null));
     return {
       id,
       sourceId: source.id,
@@ -147,7 +262,12 @@ function autoParseSource(source, parsedSections = []) {
       studyState: 'unstudied',
       inQueue: true,
       pageStart: node.pageStart,
-      pageEnd
+      pageEnd,
+      timeStartSec: node.timeStartSec,
+      timeEndSec,
+      locatorStart: node.locatorStart,
+      locatorEnd: node.locatorEnd,
+      locatorType: node.locatorType
     };
   });
 
@@ -155,26 +275,46 @@ function autoParseSource(source, parsedSections = []) {
   addedHierarchy.forEach(item => { item.isLeaf = !parentIds.has(item.id); });
   state.data.hierarchy.push(...addedHierarchy);
 
-  const addedUnits = addedHierarchy.filter(x => x.isLeaf).map((leaf, i) => ({
-    id: crypto.randomUUID(),
-    title: leaf.title,
-    hierarchyId: leaf.id,
-    sourceId: source.id,
-    sourceTitle: source.title,
-    sourceType: source.sourceType,
-    fullPath: getHierarchyPath(leaf.id, addedHierarchy),
-    pageStart: source.sourceType === 'pdf' ? leaf.pageStart : undefined,
-    pageEnd: source.sourceType === 'pdf' ? leaf.pageEnd : undefined,
-    timeStartSec: source.sourceType !== 'pdf' ? i * 180 : undefined,
-    timeEndSec: source.sourceType !== 'pdf' ? i * 180 + 150 : undefined,
-    sizeLabel: source.sourceType === 'pdf' ? '3 pages' : '2.5 min',
-    retentionScore: 0,
-    dueAt: null,
-    lastReviewedAt: null,
-    totalReviews: 0,
-    inQueue: true
-  }));
+  const addedUnits = addedHierarchy.filter(x => x.isLeaf).map((leaf) => {
+    const unit = {
+      id: crypto.randomUUID(),
+      title: leaf.title,
+      hierarchyId: leaf.id,
+      sourceId: source.id,
+      sourceTitle: source.title,
+      sourceType: source.sourceType,
+      fullPath: getHierarchyPath(leaf.id, addedHierarchy),
+      pageStart: null,
+      pageEnd: null,
+      timeStartSec: null,
+      timeEndSec: null,
+      locatorStart: null,
+      locatorEnd: null,
+      locatorType: null,
+      retentionScore: 0,
+      dueAt: null,
+      lastReviewedAt: null,
+      totalReviews: 0,
+      inQueue: true
+    };
+
+    if (source.sourceType === 'pdf') {
+      unit.pageStart = Number.isFinite(leaf.pageStart) ? leaf.pageStart : null;
+      unit.pageEnd = Number.isFinite(leaf.pageEnd) ? leaf.pageEnd : unit.pageStart;
+    } else if (['youtube', 'local_video', 'video'].includes(source.sourceType)) {
+      unit.timeStartSec = Number.isFinite(leaf.timeStartSec) ? leaf.timeStartSec : null;
+      unit.timeEndSec = Number.isFinite(leaf.timeEndSec) ? leaf.timeEndSec : unit.timeStartSec;
+    } else {
+      unit.locatorType = leaf.locatorType || 'section';
+      unit.locatorStart = leaf.locatorStart ?? unit.fullPath;
+      unit.locatorEnd = leaf.locatorEnd ?? unit.locatorStart;
+    }
+
+    unit.sizeLabel = buildUnitSizeLabel(unit);
+    return unit;
+  });
   state.data.units.push(...addedUnits);
+  Object.assign(source, inferSourceMetadata(source, addedUnits));
   source.totalUnits = addedUnits.length;
   state.view.portal.selectedHierarchyItemId = addedHierarchy.find(h => h.isLeaf)?.id || null;
   state.view.queue.selectedUnitId = addedUnits[0]?.id || null;
