@@ -40,7 +40,8 @@ input, select, textarea { background:#12172f; color:var(--text); border:1px soli
 .indent { padding-left: calc(var(--depth) * 14px); display:flex; align-items:center; gap:8px; }
 .bars { display:flex; gap:2px; cursor:pointer; }
 .bar { width:6px; height:14px; border-radius:4px; border:1px solid #69719d; }
-.bar.fill.inq { background:#6ab2ff; }
+.bar.fill.inq { background:var(--accent); border-color:var(--accent); }
+.bar.fill.off { background:#5f6686; border-color:#5f6686; }
 .bar.fill.outq { background:#a18cff; }
 .viewer { padding:12px; display:flex; flex-direction:column; }
 .viewer-doc { margin-top:8px; min-height:380px; background:#f8f8fc; color:#1c2440; border-radius:8px; padding:20px; }
