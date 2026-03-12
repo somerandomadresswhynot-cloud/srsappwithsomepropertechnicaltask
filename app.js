@@ -82,7 +82,7 @@ function autoParseSource(source, parsedSections = []) {
   const normalized = sections.map((section, idx) => ({
     title: section.title,
     pageStart: section.pageStart || idx * 5 + 1,
-    level: Number.isInteger(section.level) ? Math.max(0, Math.min(2, section.level)) : 0
+    level: Number.isInteger(section.level) ? Math.max(0, Math.min(6, section.level)) : 0
   }));
 
   const parentStack = [];
@@ -140,6 +140,12 @@ async function parsePdfHeaders(file) {
   const arrayBuffer = await file.arrayBuffer();
   const task = window.pdfjsLib.getDocument({ data: arrayBuffer });
   const pdf = await task.promise;
+
+  const outlineEntries = await parsePdfOutline(pdf);
+  if (outlineEntries.length >= 8) {
+    return outlineEntries;
+  }
+
   const pageCap = Math.min(pdf.numPages, 40);
   const candidates = [];
   const tocCandidates = [];
@@ -207,6 +213,50 @@ async function parsePdfHeaders(file) {
   return unique.slice(0, 24).sort((a, b) => a.pageStart - b.pageStart || a.level - b.level);
 }
 
+async function parsePdfOutline(pdf) {
+  const outline = await pdf.getOutline();
+  if (!outline?.length) return [];
+  const entries = [];
+
+  async function walk(items, depth) {
+    for (const item of items) {
+      const title = (item?.title || '').replace(/\s+/g, ' ').trim();
+      if (!title) {
+        if (item?.items?.length) await walk(item.items, depth + 1);
+        continue;
+      }
+      const pageStart = await resolveOutlinePageNumber(pdf, item.dest);
+      entries.push({
+        title,
+        pageStart,
+        level: Math.max(0, Math.min(6, depth)),
+        score: 20
+      });
+      if (item?.items?.length) await walk(item.items, depth + 1);
+    }
+  }
+
+  await walk(outline, 0);
+
+  return dedupeCandidates(entries, c => `${c.title.toLowerCase()}|${c.pageStart || -1}`)
+    .filter(entry => entry.pageStart !== null)
+    .sort((a, b) => a.pageStart - b.pageStart || a.level - b.level)
+    .slice(0, 120);
+}
+
+async function resolveOutlinePageNumber(pdf, dest) {
+  if (!dest) return null;
+  try {
+    const resolvedDest = typeof dest === 'string' ? await pdf.getDestination(dest) : dest;
+    if (!Array.isArray(resolvedDest) || !resolvedDest.length) return null;
+    const ref = resolvedDest[0];
+    const pageIndex = await pdf.getPageIndex(ref);
+    return pageIndex + 1;
+  } catch {
+    return null;
+  }
+}
+
 function extractTocEntries(lines) {
   const entryRegex = /^(.*?)\s(?:\.{2,}\s*|\s)(\d{1,4})$/;
   const tocLines = lines
@@ -251,7 +301,7 @@ function inferHeaderLevel(title, avgSize, medianSize, indentOffset = 0) {
   const numberingMatch = title.match(/^(\d+(?:\.\d+){0,2})\b/);
   if (numberingMatch) {
     const parts = numberingMatch[1].split('.').length;
-    return Math.max(0, Math.min(2, parts - 1));
+    return Math.max(0, Math.min(6, parts - 1));
   }
   if (indentOffset > 28) return 2;
   if (indentOffset > 12) return 1;
