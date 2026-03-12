@@ -19,6 +19,8 @@ function isLegacySeedData(data) {
 
 const persisted = JSON.parse(localStorage.getItem('srs-app-state') || 'null');
 const state = persisted && !isLegacySeedData(persisted.data) ? persisted : defaultState();
+reconcileQueueFlagsFromHierarchy();
+normalizeQueueSelection();
 const importDraft = { file: null, parsedSections: [], parsing: false };
 
 const save = () => localStorage.setItem('srs-app-state', JSON.stringify(state));
@@ -362,6 +364,14 @@ function getDescendantIds(itemId, hierarchy) {
   return descendants;
 }
 
+function reconcileQueueFlagsFromHierarchy() {
+  const hierarchyById = new Map(state.data.hierarchy.map(item => [item.id, item]));
+  state.data.units.forEach(unit => {
+    const hierarchyItem = hierarchyById.get(unit.hierarchyId);
+    if (hierarchyItem) unit.inQueue = !!hierarchyItem.inQueue;
+  });
+}
+
 async function processImportedFile(file) {
   importDraft.file = file;
   importDraft.parsedSections = [];
@@ -650,6 +660,7 @@ function getFilledBarsCount(studyState) {
 let timer;
 function renderQueue() {
   const v = state.view.queue;
+  normalizeQueueSelection();
   const units = state.data.units.filter(u => u.inQueue);
   const u = units.find(x => x.id === v.selectedUnitId) || units[0] || null;
   if (!v.selectedUnitId && u) v.selectedUnitId = u.id;
