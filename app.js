@@ -407,6 +407,14 @@ function getDescendantIds(itemId, hierarchy) {
   return descendants;
 }
 
+function reconcileQueueFlagsFromHierarchy() {
+  const hierarchyById = new Map(state.data.hierarchy.map(item => [item.id, item]));
+  state.data.units.forEach(unit => {
+    const hierarchyItem = hierarchyById.get(unit.hierarchyId);
+    if (hierarchyItem) unit.inQueue = !!hierarchyItem.inQueue;
+  });
+}
+
 async function processImportedFile(file) {
   importDraft.file = file;
   importDraft.parsedSections = [];
