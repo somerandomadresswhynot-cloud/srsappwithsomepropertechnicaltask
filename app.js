@@ -41,8 +41,28 @@ function hydratePersistedState(persistedState) {
   };
 }
 
+
+function ensureQueueConsistency() {
+  const hierarchyById = new Map(state.data.hierarchy.map(item => [item.id, item]));
+
+  state.data.hierarchy.forEach(item => {
+    if (typeof item.inQueue !== 'boolean') item.inQueue = true;
+  });
+
+  state.data.units.forEach(unit => {
+    const hierarchyItem = hierarchyById.get(unit.hierarchyId);
+    if (typeof unit.inQueue !== 'boolean') {
+      unit.inQueue = typeof hierarchyItem?.inQueue === 'boolean' ? hierarchyItem.inQueue : true;
+    }
+    if (hierarchyItem && hierarchyItem.inQueue !== unit.inQueue) {
+      hierarchyItem.inQueue = unit.inQueue;
+    }
+  });
+}
+
 const persisted = JSON.parse(localStorage.getItem('srs-app-state') || 'null');
 const state = persisted && !isLegacySeedData(persisted.data) ? hydratePersistedState(persisted) : defaultState();
+ensureQueueConsistency();
 normalizeQueueSelection();
 const importDraft = { file: null, parsedSections: [], parsing: false };
 
