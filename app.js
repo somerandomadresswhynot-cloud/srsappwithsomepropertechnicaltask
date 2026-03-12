@@ -42,6 +42,157 @@ function hydratePersistedState(persistedState) {
 }
 
 
+
+
+const viewerPdfCache = new Map();
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function deriveYouTubeEmbedUrl(url) {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.replace('www.', '');
+    if (host === 'youtu.be') {
+      const id = parsed.pathname.split('/').filter(Boolean)[0];
+      return id ? `https://www.youtube.com/embed/${id}` : null;
+    }
+    if (host === 'youtube.com' || host === 'm.youtube.com') {
+      if (parsed.pathname === '/watch') {
+        const id = parsed.searchParams.get('v');
+        return id ? `https://www.youtube.com/embed/${id}` : null;
+      }
+      if (parsed.pathname.startsWith('/embed/')) return parsed.toString();
+      if (parsed.pathname.startsWith('/shorts/')) {
+        const id = parsed.pathname.split('/').filter(Boolean)[1];
+        return id ? `https://www.youtube.com/embed/${id}` : null;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function renderUnsupportedViewer(source, containerEl, reason) {
+  containerEl.innerHTML = `<div class="viewer-fallback"><h4>Viewer unavailable</h4><p>${escapeHtml(reason || `No renderer available for source type "${source?.sourceType || 'unknown'}".`)}</p></div>`;
+}
+
+async function loadPdfDocument(source) {
+  if (!window.pdfjsLib) throw new Error('pdf.js is not loaded in this session.');
+  if (!source?.origin) throw new Error('PDF source origin/path is missing.');
+  if (viewerPdfCache.has(source.origin)) return viewerPdfCache.get(source.origin);
+  const task = window.pdfjsLib.getDocument(source.origin);
+  const pdf = await task.promise;
+  viewerPdfCache.set(source.origin, pdf);
+  return pdf;
+}
+
+async function renderPdfViewer(source, selectedUnitOrOutlineItem, containerEl, options = {}) {
+  const renderToken = `${Date.now()}-${Math.random()}`;
+  containerEl.dataset.renderToken = renderToken;
+  containerEl.innerHTML = '<div class="small">Loading PDF preview…</div>';
+
+  try {
+    const pdf = await loadPdfDocument(source);
+    const requestedPage = Number.isFinite(selectedUnitOrOutlineItem?.pageStart)
+      ? selectedUnitOrOutlineItem.pageStart
+      : Number.isFinite(options.defaultPage)
+        ? options.defaultPage
+        : 1;
+    const pageNumber = clamp(Math.floor(requestedPage), 1, pdf.numPages);
+    const scale = clamp((options.zoomPercent || 120) / 100, 0.5, 2.5);
+    const page = await pdf.getPage(pageNumber);
+    const viewport = page.getViewport({ scale });
+
+    if (containerEl.dataset.renderToken !== renderToken) return;
+    containerEl.innerHTML = `<div class="viewer-location">PDF page ${pageNumber} of ${pdf.numPages}</div>`;
+
+    const pageWrap = document.createElement('div');
+    pageWrap.className = 'pdf-page-wrap';
+    pageWrap.style.width = `${Math.ceil(viewport.width)}px`;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+    canvas.className = 'pdf-canvas';
+
+    const textLayer = document.createElement('div');
+    textLayer.className = 'pdf-text-layer';
+    textLayer.style.width = `${Math.ceil(viewport.width)}px`;
+    textLayer.style.height = `${Math.ceil(viewport.height)}px`;
+
+    pageWrap.append(canvas, textLayer);
+    containerEl.append(pageWrap);
+
+    const context = canvas.getContext('2d', { alpha: false });
+    await page.render({ canvasContext: context, viewport }).promise;
+
+    const text = await page.getTextContent();
+    const textLayerTask = window.pdfjsLib.renderTextLayer({ textContent: text, container: textLayer, viewport });
+    if (textLayerTask?.promise) await textLayerTask.promise;
+  } catch (error) {
+    renderUnsupportedViewer(source, containerEl, `Unable to render PDF preview: ${error.message}`);
+  }
+}
+
+function renderVideoViewer(source, selectedUnitOrOutlineItem, containerEl) {
+  const startSec = Math.max(0, Math.floor(selectedUnitOrOutlineItem?.timeStartSec || 0));
+  if (source?.sourceType === 'youtube') {
+    const baseEmbed = deriveYouTubeEmbedUrl(source.origin || '');
+    if (!baseEmbed) {
+      renderUnsupportedViewer(source, containerEl, 'Invalid YouTube URL. Add a full youtube.com or youtu.be link in source origin.');
+      return;
+    }
+    const withStart = startSec ? `${baseEmbed}${baseEmbed.includes('?') ? '&' : '?'}start=${startSec}` : baseEmbed;
+    containerEl.innerHTML = `<div class="viewer-location">Video at ${startSec}s</div><iframe class="video-frame" src="${withStart}" title="YouTube viewer" allowfullscreen loading="lazy"></iframe>`;
+    return;
+  }
+
+  if (source?.sourceType === 'local_video') {
+    if (!source.origin) {
+      renderUnsupportedViewer(source, containerEl, 'Local video path/URL is missing.');
+      return;
+    }
+    containerEl.innerHTML = `<div class="viewer-location">Video at ${startSec}s</div><video class="video-player" controls src="${source.origin}"></video>`;
+    const videoEl = containerEl.querySelector('video');
+    videoEl.addEventListener('loadedmetadata', () => {
+      try { videoEl.currentTime = startSec; } catch {}
+    }, { once: true });
+    return;
+  }
+
+  renderUnsupportedViewer(source, containerEl);
+}
+
+function renderSourceViewer(source, selectedUnitOrOutlineItem, containerEl, options = {}) {
+  if (!containerEl) return;
+  if (!source) {
+    renderUnsupportedViewer(source, containerEl, 'No source selected for this viewer.');
+    return;
+  }
+  if (source.sourceType === 'pdf') {
+    renderPdfViewer(source, selectedUnitOrOutlineItem, containerEl, options);
+    return;
+  }
+  if (source.sourceType === 'youtube' || source.sourceType === 'local_video') {
+    renderVideoViewer(source, selectedUnitOrOutlineItem, containerEl, options);
+    return;
+  }
+  renderUnsupportedViewer(source, containerEl);
+}
+
 function ensureQueueConsistency() {
   const hierarchyById = new Map(state.data.hierarchy.map(item => [item.id, item]));
 
@@ -630,7 +781,7 @@ function renderPortal() {
   if (!v.selectedHierarchyItemId && selected) v.selectedHierarchyItemId = selected.id;
 
   pageRoot.innerHTML = `<div class="portal"><aside class="panel"><div style="padding:10px"><h3>${source.title}</h3><input id="outline-search" placeholder="Search outline" value="${v.outlineSearchText}"></div><div class="outline-tools"><span class="small">Queue all</span><button class="queue-master ${allInQueue ? 'queue-on' : 'queue-off'}" id="toggle-all-queue" title="${allInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue'}" aria-label="${allInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue'}"></button></div><div class="outline-list">${filtered.map(item => `<div class="outline-item ${item.id === selected?.id ? 'selected' : ''}" data-item="${item.id}"><div class="indent" style="--depth:${item.depth}">${item.isLeaf ? '📄' : '📁'} ${item.title}</div>${renderQueueBars(item)}</div>`).join('') || '<p class="small" style="padding:8px">No outline items.</p>'}</div></aside>
-  <section class="panel viewer"><div class="row" style="justify-content:space-between"><h3>Viewer</h3><div class="controls"><button class="btn" id="zoom-out">-</button><span>${v.viewerZoom || 120}%</span><button class="btn" id="zoom-in">+</button></div></div><div class="small">${source.sourceType === 'pdf' ? `PDF Page ${selected?.pageStart || v.viewerPage}` : `Time ${selected?.timeStartSec || 0}s`}</div><div class="viewer-doc" style="font-size:${(v.viewerZoom || 120) / 100}em"><h2>${selected?.title || 'No item selected'}</h2><p>Simulated embedded source viewer region. In production this panel maps to actual PDF/video location and allows highlighting.</p></div></section>
+  <section class="panel viewer"><div class="row" style="justify-content:space-between"><h3>Viewer</h3><div class="controls"><button class="btn" id="zoom-out">-</button><span>${v.viewerZoom || 120}%</span><button class="btn" id="zoom-in">+</button></div></div><div class="small">${selected?.title || 'No item selected'}</div><div id="portal-viewer-content" class="viewer-doc"></div></section>
   <aside class="panel" style="padding:12px"><h3>Unit Meta</h3><div class="small">Source Type: ${source.sourceType}</div><div class="small">Priority: ${source.priority}</div><div class="small">Units: ${source.totalUnits}</div><div class="small">Queue On/Off via bars in outline.</div></aside></div>`;
 
   document.getElementById('outline-search').oninput = e => { v.outlineSearchText = e.target.value; renderPortal(); save(); };
@@ -666,6 +817,18 @@ function renderPortal() {
   document.querySelectorAll('[data-toggle]').forEach(el => el.onclick = onToggleQueue);
   document.getElementById('zoom-in').onclick = () => { v.viewerZoom = Math.min(200, (v.viewerZoom || 120) + 10); renderPortal(); save(); };
   document.getElementById('zoom-out').onclick = () => { v.viewerZoom = Math.max(50, (v.viewerZoom || 120) - 10); renderPortal(); save(); };
+
+  const portalViewerItem = selected
+    ? {
+      title: selected.title,
+      pageStart: selected.pageStart,
+      timeStartSec: state.data.units.find(unit => unit.hierarchyId === selected.id && unit.sourceId === source.id)?.timeStartSec || 0
+    }
+    : null;
+  renderSourceViewer(source, portalViewerItem, document.getElementById('portal-viewer-content'), {
+    zoomPercent: v.viewerZoom || 120,
+    defaultPage: v.viewerPage || 1
+  });
 }
 
 function normalizeQueueSelection() {
@@ -711,7 +874,7 @@ function renderQueue() {
   pageRoot.innerHTML = `<div class="queue"><aside class="panel queue-list"><h2>Study Queue</h2>${units.length ? units.map(x => `<div class="queue-item ${x.id === u?.id ? 'active' : ''}" data-unit="${x.id}"><strong>${x.title}</strong><div class="small">${x.sourceTitle} • ${x.sizeLabel}</div><div>${x.retentionScore}%</div></div>`).join('') : '<p class="small">No units in queue yet. Import a source and keep units enabled in queue from Source Portal.</p>'}</aside>
   <section class="col"><div class="panel" style="padding:12px"><h3>${u?.title || 'No unit selected'}</h3><div class="small">${u ? `${u.sourceTitle} • ${u.pageStart ? `pp.${u.pageStart}-${u.pageEnd}` : `${u.timeStartSec || 0}-${u.timeEndSec || 0}s`}` : 'Select a unit to begin.'}</div><div class="row"><button class="btn" id="open-history" ${u ? '' : 'disabled'}>Review History</button><div class="small">Retention<div>${u?.retentionScore || 0}%</div></div></div></div>
   <div class="panel" style="padding:12px"><div class="controls"><strong id="timer">${format(v.elapsedSec)}</strong><button class="btn" id="start-stop" ${u ? '' : 'disabled'}>${v.timerRunning ? 'Pause' : 'Start'}</button><button class="btn" id="restart" ${u ? '' : 'disabled'}>Restart</button><button class="btn outcome" data-outcome="easy" ${u ? '' : 'disabled'}>Easy</button><button class="btn outcome" data-outcome="with_effort" ${u ? '' : 'disabled'}>With Effort</button><button class="btn outcome" data-outcome="hard" ${u ? '' : 'disabled'}>Hard</button><button class="btn outcome" data-outcome="skip" ${u ? '' : 'disabled'}>Skip</button></div><div class="row"><textarea id="pre-note" rows="3" placeholder="Pre-recall note" style="flex:1">${v.preRecallNote || ''}</textarea><textarea id="post-note" rows="3" placeholder="Post-recall note" style="flex:1">${v.postRecallNote || ''}</textarea></div></div>
-  <div class="panel viewer" style="min-height:220px"><div class="small">Embedded ${u?.sourceType || 'source'} viewer @ ${u?.pageStart ? `page ${u.pageStart}` : `${u?.timeStartSec || 0}s`}</div><div class="viewer-doc"><h3>${u?.title || 'No unit loaded'}</h3><p>${u ? 'Context viewer opens at mapped location for quick review.' : 'Import and parse sources first to see review context here.'}</p></div></div></section></div>`;
+  <div class="panel viewer" style="min-height:220px"><div class="small">${u?.title || 'No unit loaded'}</div><div id="queue-viewer-content" class="viewer-doc"></div></div></section></div>`;
 
   document.querySelectorAll('[data-unit]').forEach(el => el.onclick = () => { v.selectedUnitId = el.dataset.unit; renderQueue(); save(); });
   document.getElementById('pre-note').oninput = e => { v.preRecallNote = e.target.value; save(); };
@@ -720,6 +883,12 @@ function renderQueue() {
   document.getElementById('start-stop').onclick = () => { if (v.timerRunning) { v.elapsedSec += Math.floor((Date.now() - v.timerStartedAt) / 1000); v.timerRunning = false; } else { v.timerStartedAt = Date.now(); v.timerRunning = true; tick(); } save(); renderQueue(); };
   document.querySelectorAll('.outcome').forEach(b => b.onclick = () => u && completeReview(b.dataset.outcome, u));
   document.getElementById('open-history').onclick = () => u && openHistory(u.id);
+
+  const queueSource = u ? state.data.sources.find(source => source.id === u.sourceId) || null : null;
+  renderSourceViewer(queueSource, u, document.getElementById('queue-viewer-content'), {
+    zoomPercent: state.view.portal.viewerZoom || 120,
+    defaultPage: state.view.portal.viewerPage || 1
+  });
 }
 
 function tick() {
