@@ -17,8 +17,33 @@ function isLegacySeedData(data) {
   return Array.isArray(data?.sources) && data.sources.some(s => legacyTitles.includes(s.title));
 }
 
+function hydratePersistedState(persistedState) {
+  const base = defaultState();
+  if (!persistedState || typeof persistedState !== 'object') return base;
+
+  const data = persistedState.data && typeof persistedState.data === 'object' ? persistedState.data : {};
+  const view = persistedState.view && typeof persistedState.view === 'object' ? persistedState.view : {};
+
+  return {
+    data: {
+      sources: Array.isArray(data.sources) ? data.sources : [],
+      hierarchy: Array.isArray(data.hierarchy) ? data.hierarchy : [],
+      units: Array.isArray(data.units) ? data.units : [],
+      reviews: Array.isArray(data.reviews) ? data.reviews : [],
+      revisions: Array.isArray(data.revisions) ? data.revisions : []
+    },
+    view: {
+      page: typeof view.page === 'string' ? view.page : base.view.page,
+      sources: { ...base.view.sources, ...(view.sources || {}) },
+      portal: { ...base.view.portal, ...(view.portal || {}) },
+      queue: { ...base.view.queue, ...(view.queue || {}) }
+    }
+  };
+}
+
 const persisted = JSON.parse(localStorage.getItem('srs-app-state') || 'null');
-const state = persisted && !isLegacySeedData(persisted.data) ? persisted : defaultState();
+const state = persisted && !isLegacySeedData(persisted.data) ? hydratePersistedState(persisted) : defaultState();
+normalizeQueueSelection();
 const importDraft = { file: null, parsedSections: [], parsing: false };
 
 const save = () => localStorage.setItem('srs-app-state', JSON.stringify(state));
@@ -583,22 +608,9 @@ function renderPortal() {
   document.getElementById('outline-search').oninput = e => { v.outlineSearchText = e.target.value; renderPortal(); save(); };
   document.getElementById('toggle-all-queue').onclick = () => {
     const nextState = !outline.every(item => item.inQueue);
-    applyQueueStateForItems(outline, nextState);
-    document.querySelectorAll('.outline-item .bars').forEach(node => {
-      const id = node.dataset.toggle;
-      const item = state.data.hierarchy.find(x => x.id === id);
-      if (!item) return;
-      node.outerHTML = renderQueueBars(item);
-    });
-    document.querySelectorAll('[data-toggle]').forEach(el => el.onclick = onToggleQueue);
-    const toggleAll = document.getElementById('toggle-all-queue');
-    if (toggleAll) {
-      toggleAll.classList.toggle('queue-on', nextState);
-      toggleAll.classList.toggle('queue-off', !nextState);
-      toggleAll.title = nextState ? 'Turn all OFF in queue' : 'Turn all ON in queue';
-      toggleAll.setAttribute('aria-label', toggleAll.title);
-    }
+    setQueueStateForHierarchyIds(outline.map(item => item.id), nextState);
     save();
+    render();
   };
   document.querySelectorAll('[data-item]').forEach(el => el.onclick = () => {
     v.selectedHierarchyItemId = el.dataset.item;
@@ -617,31 +629,10 @@ function renderPortal() {
 
     const nextState = !i.inQueue;
     const related = state.data.hierarchy.filter(x => x.sourceId === i.sourceId);
-    const affected = new Set([i.id, ...getDescendantIds(i.id, related)]);
-
-    const affectedItems = related.filter(node => affected.has(node.id));
-    applyQueueStateForItems(affectedItems, nextState);
-
-    affected.forEach(id => {
-      const target = document.querySelector(`[data-item="${id}"] .bars`);
-      const node = state.data.hierarchy.find(x => x.id === id);
-      if (!target || !node) return;
-      target.outerHTML = renderQueueBars(node);
-      const replacement = document.querySelector(`[data-item="${id}"] .bars`);
-      if (replacement) replacement.onclick = onToggleQueue;
-    });
-
-    const toggleAll = document.getElementById('toggle-all-queue');
-    const sourceItems = state.data.hierarchy.filter(node => node.sourceId === i.sourceId);
-    const sourceAllInQueue = sourceItems.length ? sourceItems.every(node => node.inQueue) : true;
-    if (toggleAll) {
-      toggleAll.classList.toggle('queue-on', sourceAllInQueue);
-      toggleAll.classList.toggle('queue-off', !sourceAllInQueue);
-      toggleAll.title = sourceAllInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue';
-      toggleAll.setAttribute('aria-label', toggleAll.title);
-    }
-
+    const affected = [i.id, ...getDescendantIds(i.id, related)];
+    setQueueStateForHierarchyIds(affected, nextState);
     save();
+    render();
   };
 
   document.querySelectorAll('[data-toggle]').forEach(el => el.onclick = onToggleQueue);
@@ -649,14 +640,23 @@ function renderPortal() {
   document.getElementById('zoom-out').onclick = () => { v.viewerZoom = Math.max(50, (v.viewerZoom || 120) - 10); renderPortal(); save(); };
 }
 
-function applyQueueStateForItems(items, nextState) {
-  const itemIds = new Set(items.map(item => item.id));
+function normalizeQueueSelection() {
+  const queuedUnits = state.data.units.filter(unit => unit.inQueue);
+  const selectedUnitIsQueued = queuedUnits.some(unit => unit.id === state.view.queue.selectedUnitId);
+  if (!selectedUnitIsQueued) {
+    state.view.queue.selectedUnitId = queuedUnits[0]?.id || null;
+  }
+}
+
+function setQueueStateForHierarchyIds(hierarchyIds, nextState) {
+  const itemIds = new Set(hierarchyIds);
   state.data.hierarchy.forEach(node => {
     if (itemIds.has(node.id)) node.inQueue = nextState;
   });
   state.data.units.forEach(unit => {
     if (itemIds.has(unit.hierarchyId)) unit.inQueue = nextState;
   });
+  normalizeQueueSelection();
 }
 
 function renderQueueBars(item) {
@@ -675,6 +675,7 @@ function getFilledBarsCount(studyState) {
 let timer;
 function renderQueue() {
   const v = state.view.queue;
+  normalizeQueueSelection();
   const units = state.data.units.filter(u => u.inQueue);
   const u = units.find(x => x.id === v.selectedUnitId) || units[0] || null;
   if (!v.selectedUnitId && u) v.selectedUnitId = u.id;
