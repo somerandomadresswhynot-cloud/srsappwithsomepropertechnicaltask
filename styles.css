@@ -52,6 +52,8 @@ input, select, textarea { background:#12172f; color:var(--text); border:1px soli
 .queue-item.active { border-color:#7ba5ff; background:#273463; }
 .controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
 .btn { border:1px solid var(--line); background:#2a335f; color:var(--text); border-radius:9px; padding:8px 12px; cursor:pointer; }
+.btn.danger { background:#7a2f3f; border-color:#9d4a5a; }
+.btn.danger:hover { background:#8c384a; }
 .btn.outcome[data-outcome='easy']{background:#2f6b4a}
 .btn.outcome[data-outcome='with_effort']{background:#87662d}
 .btn.outcome[data-outcome='hard']{background:#87423b}

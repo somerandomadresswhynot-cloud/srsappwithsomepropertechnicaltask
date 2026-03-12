@@ -266,6 +266,71 @@ function closeImportModal() {
   document.getElementById('import-modal-wrap')?.remove();
 }
 
+function openDeleteSourceModal(source) {
+  if (!source) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'modal-backdrop';
+  wrap.id = 'delete-source-modal-wrap';
+  wrap.innerHTML = `<div class="panel modal"><div class="row" style="justify-content:space-between"><h2>Delete Source</h2><button class="btn" id="close-delete-source">✕</button></div>
+    <p>You are going to <strong>delete</strong> source <strong>${source.title}</strong>.</p>
+    <p class="small">Type <code>delete</code> to confirm.</p>
+    <label>Confirmation <input id="delete-source-confirmation" placeholder="delete" autocomplete="off"></label>
+    <div class="row"><button class="btn danger" id="confirm-delete-source" disabled>Delete Source</button><button class="btn" id="cancel-delete-source">Cancel</button></div>
+  </div>`;
+  document.body.appendChild(wrap);
+
+  const close = () => wrap.remove();
+  const confirmation = document.getElementById('delete-source-confirmation');
+  const confirmButton = document.getElementById('confirm-delete-source');
+
+  confirmation.oninput = e => {
+    confirmButton.disabled = e.target.value.trim() !== 'delete';
+  };
+
+  document.getElementById('close-delete-source').onclick = close;
+  document.getElementById('cancel-delete-source').onclick = close;
+  confirmButton.onclick = () => {
+    deleteSource(source.id);
+    close();
+  };
+}
+
+function deleteSource(sourceId) {
+  const sourceIndex = state.data.sources.findIndex(s => s.id === sourceId);
+  if (sourceIndex === -1) return;
+
+  const removedSource = state.data.sources[sourceIndex];
+  const unitIds = new Set(state.data.units.filter(u => u.sourceId === sourceId).map(u => u.id));
+
+  state.data.sources.splice(sourceIndex, 1);
+  state.data.hierarchy = state.data.hierarchy.filter(item => item.sourceId !== sourceId);
+  state.data.units = state.data.units.filter(unit => unit.sourceId !== sourceId);
+  state.data.reviews = state.data.reviews.filter(review => !unitIds.has(review.unitId));
+  state.data.revisions = state.data.revisions.filter(revision => {
+    if (!revision.reviewId) return true;
+    return state.data.reviews.some(review => review.id === revision.reviewId);
+  });
+
+  if (state.view.sources.selectedSourceId === sourceId) {
+    state.view.sources.selectedSourceId = state.data.sources[0]?.id || null;
+  }
+  if (state.view.portal.sourceId === sourceId) {
+    state.view.portal.sourceId = state.data.sources[0]?.id || null;
+    state.view.portal.selectedHierarchyItemId = state.data.hierarchy.find(item => item.sourceId === state.view.portal.sourceId)?.id || null;
+  }
+  if (state.view.queue.selectedUnitId && unitIds.has(state.view.queue.selectedUnitId)) {
+    state.view.queue.selectedUnitId = state.data.units[0]?.id || null;
+  }
+
+  if (!state.data.sources.length && state.view.page === 'portal') {
+    state.view.page = 'sources';
+  }
+
+  console.info(`Deleted source: ${removedSource.title}`);
+  render();
+  save();
+}
+
 function renderSources() {
   const v = state.view.sources;
   const rows = state.data.sources
@@ -275,7 +340,7 @@ function renderSources() {
   <aside class="panel" style="padding:12px"><h3>Source Meta</h3>${(() => {
     const s = state.data.sources.find(x => x.id === v.selectedSourceId) || rows[0];
     if (!s) return '<p class="small">Select a source to view metadata and open its portal.</p>';
-    return `<div class="col"><div><strong>${s.title}</strong></div><div class="small">Origin: ${s.origin}</div><div class="chips">${s.tags.map(t => `<span class="chip">${t}</span>`).join(' ') || '<span class="small">No tags</span>'}</div><button class="btn" id="open-portal">Open Source Portal</button></div>`;
+    return `<div class="col"><div><strong>${s.title}</strong></div><div class="small">Origin: ${s.origin}</div><div class="chips">${s.tags.map(t => `<span class="chip">${t}</span>`).join(' ') || '<span class="small">No tags</span>'}</div><div class="row"><button class="btn" id="open-portal">Open Source Portal</button><button class="btn danger" id="delete-source">Delete Source</button></div></div>`;
   })()}</aside></section>`;
 
   document.getElementById('src-type').value = v.sourceTypeFilter;
@@ -300,6 +365,11 @@ function renderSources() {
     state.view.page = 'portal';
     render();
     save();
+  };
+  const deleteButton = document.getElementById('delete-source');
+  if (deleteButton) deleteButton.onclick = () => {
+    const source = state.data.sources.find(x => x.id === v.selectedSourceId) || rows[0];
+    openDeleteSourceModal(source);
   };
 }
 
