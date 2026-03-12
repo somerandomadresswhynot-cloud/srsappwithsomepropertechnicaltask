@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SRS Rereading App</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <header class="topbar">
+      <div class="brand">📘 SRS Reader</div>
+      <nav class="nav-tabs">
+        <button data-page="queue" class="nav-btn active">Study Queue</button>
+        <button data-page="sources" class="nav-btn">Sources</button>
+        <button data-page="settings" class="nav-btn">Settings</button>
+      </nav>
+      <div class="top-actions">🔎 🔔 👤</div>
+    </header>
+    <main id="page-root"></main>
+  </div>
+
+  <div id="context-menu" class="context-menu hidden"></div>
+  <script src="app.js"></script>
+</body>
+</html>
