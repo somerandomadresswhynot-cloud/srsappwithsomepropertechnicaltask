@@ -37,7 +37,7 @@ def _coerce_outline_items(items: list[Any], depth: int = 0) -> list[dict[str, An
         if page_start is None or page_start <= 0:
             continue
 
-        result.append({"title": title, "pageStart": page_start, "level": min(depth, 6)})
+        result.append({"title": title, "pageStart": page_start, "level": min(depth, 6), "score": 30})
     return result
 
 
@@ -80,9 +80,9 @@ class Handler(BaseHTTPRequestHandler):
             outline = reader.outline or []
             sections = _coerce_outline_items(outline)
             sections.sort(key=lambda x: (x["pageStart"], x["level"]))
-            self._json({"sections": sections[:200]})
+            self._json({"sections": sections[:200], "pdfTotalPages": len(reader.pages)})
         except Exception as exc:  # noqa: BLE001
-            self._json({"sections": [], "error": str(exc)}, status=200)
+            self._json({"sections": [], "pdfTotalPages": None, "error": str(exc)}, status=200)
 
     def _json(self, data: dict[str, Any], status: int = 200) -> None:
         payload = json.dumps(data).encode("utf-8")

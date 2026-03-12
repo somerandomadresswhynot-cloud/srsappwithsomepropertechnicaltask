@@ -128,7 +128,8 @@ function inferSourceMetadata(source, units = []) {
 
   if (source.sourceType === 'pdf') {
     const maxPage = Math.max(...units.map(u => Number.isFinite(u.pageEnd) ? u.pageEnd : (Number.isFinite(u.pageStart) ? u.pageStart : 0)), 0);
-    metadata.totalPages = maxPage > 0 ? maxPage : null;
+    const parsedTotalPages = Number.isFinite(source.totalPages) ? source.totalPages : 0;
+    metadata.totalPages = Math.max(maxPage, parsedTotalPages) || null;
   } else if (['youtube', 'local_video', 'video'].includes(source.sourceType)) {
     const maxTime = Math.max(...units.map(u => Number.isFinite(u.timeEndSec) ? u.timeEndSec : (Number.isFinite(u.timeStartSec) ? u.timeStartSec : 0)), 0);
     metadata.durationSec = maxTime > 0 ? maxTime : null;
@@ -477,7 +478,7 @@ const persisted = JSON.parse(localStorage.getItem('srs-app-state') || 'null');
 const state = persisted && !isLegacySeedData(persisted.data) ? hydratePersistedState(persisted) : defaultState();
 ensureQueueConsistency();
 normalizeQueueSelection();
-const importDraft = { file: null, parsedSections: [], parsing: false };
+const importDraft = { file: null, parsedSections: [], parsedPdfTotalPages: null, parsing: false };
 
 const save = () => localStorage.setItem('srs-app-state', JSON.stringify(state));
 const pageRoot = document.getElementById('page-root');
@@ -520,7 +521,10 @@ function importSourceFromForm() {
   };
 
   state.data.sources.push(source);
-  autoParseSource(source, importDraft.parsedSections);
+  if (source.sourceType === 'pdf' && Number.isFinite(importDraft.parsedPdfTotalPages)) {
+    source.totalPages = importDraft.parsedPdfTotalPages;
+  }
+  autoParseSource(source, importDraft.parsedSections, importDraft.parsedPdfTotalPages);
   state.view.sources.selectedSourceId = sourceId;
   state.view.portal.sourceId = sourceId;
   state.view.page = 'sources';
@@ -529,7 +533,7 @@ function importSourceFromForm() {
   save();
 }
 
-function autoParseSource(source, parsedSections = []) {
+function autoParseSource(source, parsedSections = [], pdfTotalPages = null) {
   const sections = parsedSections.length
     ? parsedSections
     : [
@@ -540,30 +544,60 @@ function autoParseSource(source, parsedSections = []) {
       { title: 'Chapter 2 Summary', pageStart: 13, level: 0 }
     ];
 
-  const normalized = sections.map((section) => ({
+  const normalized = sections.map((section, index) => ({
     title: section.title,
-    pageStart: Number.isFinite(section.pageStart) ? section.pageStart : null,
-    pageEnd: Number.isFinite(section.pageEnd) ? section.pageEnd : null,
+    pageStart: Number.isFinite(section.pageStart) ? Math.max(1, Math.floor(section.pageStart)) : null,
+    pageEnd: Number.isFinite(section.pageEnd) ? Math.max(1, Math.floor(section.pageEnd)) : null,
     timeStartSec: Number.isFinite(section.timeStartSec) ? section.timeStartSec : null,
     timeEndSec: Number.isFinite(section.timeEndSec) ? section.timeEndSec : null,
     locatorStart: section.locatorStart ?? null,
     locatorEnd: section.locatorEnd ?? null,
     locatorType: typeof section.locatorType === 'string' && section.locatorType.trim() ? section.locatorType : null,
-    level: Number.isInteger(section.level) ? Math.max(0, Math.min(6, section.level)) : 0
+    level: Number.isInteger(section.level) ? Math.max(0, Math.min(6, section.level)) : 0,
+    score: Number.isFinite(section.score) ? section.score : 0,
+    index
   }));
 
+  const isPdfSource = source.sourceType === 'pdf';
+  const normalizedPdfTotalPages = Number.isFinite(pdfTotalPages) && pdfTotalPages > 0
+    ? Math.max(1, Math.floor(pdfTotalPages))
+    : (Number.isFinite(source.totalPages) && source.totalPages > 0 ? Math.max(1, Math.floor(source.totalPages)) : null);
+
+  const normalizedSections = isPdfSource
+    ? collapseSectionsByStart(normalized)
+    : normalized;
+
   const parentStack = [];
-  const addedHierarchy = normalized.map((node, idx) => {
+  const addedHierarchy = normalizedSections.map((node, idx) => {
     parentStack.length = node.level;
     const parentId = parentStack[parentStack.length - 1] || null;
     const id = crypto.randomUUID();
     parentStack.push(id);
-    const next = normalized[idx + 1];
-    const pageEnd = Number.isFinite(node.pageEnd)
-      ? Math.max(node.pageEnd, node.pageStart || node.pageEnd)
-      : (Number.isFinite(node.pageStart) && Number.isFinite(next?.pageStart)
-        ? Math.max(node.pageStart, next.pageStart - 1)
-        : (Number.isFinite(node.pageStart) ? node.pageStart : null));
+    const next = normalizedSections[idx + 1];
+    const pageStart = Number.isFinite(normalizedPdfTotalPages) && Number.isFinite(node.pageStart)
+      ? clamp(node.pageStart, 1, normalizedPdfTotalPages)
+      : node.pageStart;
+    let pageEnd = Number.isFinite(node.pageEnd)
+      ? Math.max(node.pageEnd, pageStart || node.pageEnd)
+      : null;
+    if (isPdfSource) {
+      const nextDistinct = normalizedSections.slice(idx + 1).find(candidate => Number.isFinite(candidate.pageStart) && candidate.pageStart > node.pageStart);
+      if (!Number.isFinite(pageEnd) && Number.isFinite(pageStart) && Number.isFinite(nextDistinct?.pageStart)) {
+        pageEnd = nextDistinct.pageStart - 1;
+      }
+      if (!Number.isFinite(pageEnd) && Number.isFinite(pageStart) && Number.isFinite(normalizedPdfTotalPages)) {
+        pageEnd = normalizedPdfTotalPages;
+      }
+      if (!Number.isFinite(pageEnd) && Number.isFinite(pageStart)) {
+        pageEnd = pageStart;
+      }
+      if (Number.isFinite(pageStart) && Number.isFinite(pageEnd) && pageEnd < pageStart) {
+        pageEnd = pageStart;
+      }
+      if (Number.isFinite(normalizedPdfTotalPages) && Number.isFinite(pageEnd)) {
+        pageEnd = clamp(pageEnd, 1, normalizedPdfTotalPages);
+      }
+    }
     const timeEndSec = Number.isFinite(node.timeEndSec)
       ? Math.max(node.timeEndSec, node.timeStartSec || node.timeEndSec)
       : (Number.isFinite(node.timeStartSec) && Number.isFinite(next?.timeStartSec)
@@ -578,7 +612,7 @@ function autoParseSource(source, parsedSections = []) {
       isLeaf: false,
       studyState: 'unstudied',
       inQueue: true,
-      pageStart: node.pageStart,
+      pageStart,
       pageEnd,
       timeStartSec: node.timeStartSec,
       timeEndSec,
@@ -640,8 +674,8 @@ function autoParseSource(source, parsedSections = []) {
 async function parsePdfHeaders(file) {
   if (!window.pdfjsLib) throw new Error('PDF parser not loaded.');
 
-  const pypdfEntries = await parseWithPyPdfService(file);
-  if (pypdfEntries.length >= 4) return pypdfEntries;
+  const pypdfResult = await parseWithPyPdfService(file);
+  if (pypdfResult.sections.length >= 4) return pypdfResult;
 
   const arrayBuffer = await file.arrayBuffer();
   const task = window.pdfjsLib.getDocument({ data: arrayBuffer });
@@ -649,7 +683,7 @@ async function parsePdfHeaders(file) {
 
   const outlineEntries = await parsePdfOutline(pdf);
   if (outlineEntries.length >= 8) {
-    return outlineEntries;
+    return { sections: outlineEntries, pdfTotalPages: pdf.numPages };
   }
 
   const pageCap = Math.min(pdf.numPages, 40);
@@ -706,9 +740,12 @@ async function parsePdfHeaders(file) {
 
   if (tocCandidates.length >= 8) {
     const dedup = dedupeCandidates(tocCandidates, c => `${c.title.toLowerCase()}|${c.pageStart}`);
-    return dedup
-      .sort((a, b) => a.pageStart - b.pageStart || a.level - b.level)
-      .slice(0, 80);
+    return {
+      sections: dedup
+        .sort((a, b) => a.pageStart - b.pageStart || a.level - b.level)
+        .slice(0, 80),
+      pdfTotalPages: pdf.numPages
+    };
   }
 
   const unique = dedupeCandidates(
@@ -716,7 +753,10 @@ async function parsePdfHeaders(file) {
     c => c.title.toLowerCase()
   );
 
-  return unique.slice(0, 24).sort((a, b) => a.pageStart - b.pageStart || a.level - b.level);
+  return {
+    sections: unique.slice(0, 24).sort((a, b) => a.pageStart - b.pageStart || a.level - b.level),
+    pdfTotalPages: pdf.numPages
+  };
 }
 
 async function parseWithPyPdfService(file) {
@@ -725,20 +765,23 @@ async function parseWithPyPdfService(file) {
     const formData = new FormData();
     formData.append('file', file, file.name || 'source.pdf');
     const response = await fetch(endpoint, { method: 'POST', body: formData });
-    if (!response.ok) return [];
+    if (!response.ok) return { sections: [], pdfTotalPages: null };
     const data = await response.json();
-    if (!Array.isArray(data?.sections)) return [];
-    return data.sections
-      .map(item => ({
-        title: (item.title || '').trim(),
-        pageStart: Number(item.pageStart),
-        level: Number.isInteger(item.level) ? Math.max(0, Math.min(6, item.level)) : 0,
-        score: 30
-      }))
-      .filter(item => item.title && Number.isFinite(item.pageStart) && item.pageStart > 0)
-      .sort((a, b) => a.pageStart - b.pageStart || a.level - b.level);
+    if (!Array.isArray(data?.sections)) return { sections: [], pdfTotalPages: null };
+    return {
+      sections: data.sections
+        .map(item => ({
+          title: (item.title || '').trim(),
+          pageStart: Number(item.pageStart),
+          level: Number.isInteger(item.level) ? Math.max(0, Math.min(6, item.level)) : 0,
+          score: Number.isFinite(item.score) ? Number(item.score) : 30
+        }))
+        .filter(item => item.title && Number.isFinite(item.pageStart) && item.pageStart > 0)
+        .sort((a, b) => a.pageStart - b.pageStart || a.level - b.level),
+      pdfTotalPages: Number.isFinite(data?.pdfTotalPages) ? Number(data.pdfTotalPages) : null
+    };
   } catch {
-    return [];
+    return { sections: [], pdfTotalPages: null };
   }
 }
 
@@ -811,6 +854,38 @@ function extractTocEntries(lines) {
   }));
 }
 
+
+function collapseSectionsByStart(sections) {
+  const sorted = [...sections].sort((a, b) => {
+    const aStart = Number.isFinite(a.pageStart) ? a.pageStart : Number.POSITIVE_INFINITY;
+    const bStart = Number.isFinite(b.pageStart) ? b.pageStart : Number.POSITIVE_INFINITY;
+    if (aStart !== bStart) return aStart - bStart;
+    if (a.level !== b.level) return a.level - b.level;
+    if (a.score !== b.score) return b.score - a.score;
+    return a.index - b.index;
+  });
+
+  const collapsed = [];
+  for (const section of sorted) {
+    const prev = collapsed[collapsed.length - 1];
+    if (prev && Number.isFinite(prev.pageStart) && prev.pageStart === section.pageStart) {
+      if (section.level < prev.level || (section.level === prev.level && section.score > prev.score)) {
+        collapsed[collapsed.length - 1] = section;
+      }
+      continue;
+    }
+    collapsed.push(section);
+  }
+  return collapsed;
+}
+
+function formatRangeLabel(item) {
+  if (!item) return '';
+  if (Number.isFinite(item.pageStart) && Number.isFinite(item.pageEnd)) return `pp.${item.pageStart}-${item.pageEnd}`;
+  if (Number.isFinite(item.timeStartSec) && Number.isFinite(item.timeEndSec)) return `${item.timeStartSec}-${item.timeEndSec}s`;
+  return '';
+}
+
 function dedupeCandidates(list, keyFn) {
   const unique = [];
   const seen = new Set();
@@ -875,6 +950,7 @@ function reconcileQueueFlagsFromHierarchy() {
 async function processImportedFile(file) {
   importDraft.file = file;
   importDraft.parsedSections = [];
+  importDraft.parsedPdfTotalPages = null;
   const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
   const status = document.getElementById('import-parse-status');
 
@@ -891,8 +967,10 @@ async function processImportedFile(file) {
   importDraft.parsing = true;
   status.textContent = 'Parsing PDF headers…';
   try {
-    const headers = await parsePdfHeaders(file);
-    importDraft.parsedSections = headers.map(h => ({ title: h.title, pageStart: h.pageStart, level: h.level }));
+    const parsed = await parsePdfHeaders(file);
+    const headers = parsed.sections || [];
+    importDraft.parsedPdfTotalPages = Number.isFinite(parsed.pdfTotalPages) ? parsed.pdfTotalPages : null;
+    importDraft.parsedSections = headers.map(h => ({ title: h.title, pageStart: h.pageStart, level: h.level, score: h.score }));
     status.textContent = headers.length
       ? `Detected ${headers.length} candidate headers: ${headers.slice(0, 3).map(h => h.title).join(', ')}${headers.length > 3 ? '…' : ''}`
       : 'No strong headers detected; default sections will be used.';
@@ -907,6 +985,7 @@ async function processImportedFile(file) {
 function openImportModal() {
   importDraft.file = null;
   importDraft.parsedSections = [];
+  importDraft.parsedPdfTotalPages = null;
   importDraft.parsing = false;
 
   const wrap = document.createElement('div');
@@ -962,6 +1041,10 @@ function openImportModal() {
 }
 
 function closeImportModal() {
+  importDraft.file = null;
+  importDraft.parsedSections = [];
+  importDraft.parsedPdfTotalPages = null;
+  importDraft.parsing = false;
   document.getElementById('import-modal-wrap')?.remove();
 }
 
@@ -1094,7 +1177,7 @@ function renderPortal() {
   const allInQueue = outline.length ? outline.every(item => item.inQueue) : true;
   if (!v.selectedHierarchyItemId && selected) v.selectedHierarchyItemId = selected.id;
 
-  pageRoot.innerHTML = `<div class="portal"><aside class="panel"><div style="padding:10px"><h3>${source.title}</h3><input id="outline-search" placeholder="Search outline" value="${v.outlineSearchText}"></div><div class="outline-tools"><span class="small">Queue all</span><button class="queue-master ${allInQueue ? 'queue-on' : 'queue-off'}" id="toggle-all-queue" title="${allInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue'}" aria-label="${allInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue'}"></button></div><div class="outline-list">${filtered.map(item => `<div class="outline-item ${item.id === selected?.id ? 'selected' : ''}" data-item="${item.id}"><div class="indent" style="--depth:${item.depth}">${item.isLeaf ? '📄' : '📁'} ${item.title}</div>${renderQueueBars(item)}</div>`).join('') || '<p class="small" style="padding:8px">No outline items.</p>'}</div></aside>
+  pageRoot.innerHTML = `<div class="portal"><aside class="panel"><div style="padding:10px"><h3>${source.title}</h3><input id="outline-search" placeholder="Search outline" value="${v.outlineSearchText}"></div><div class="outline-tools"><span class="small">Queue all</span><button class="queue-master ${allInQueue ? 'queue-on' : 'queue-off'}" id="toggle-all-queue" title="${allInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue'}" aria-label="${allInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue'}"></button></div><div class="outline-list">${filtered.map(item => `<div class="outline-item ${item.id === selected?.id ? 'selected' : ''}" data-item="${item.id}"><div><div class="indent" style="--depth:${item.depth}">${item.isLeaf ? '📄' : '📁'} ${item.title}</div>${formatRangeLabel(item) ? `<div class="small" style="padding-left:${Math.min(item.depth + 1, 6) * 16}px">${formatRangeLabel(item)}</div>` : ''}</div>${renderQueueBars(item)}</div>`).join('') || '<p class="small" style="padding:8px">No outline items.</p>'}</div></aside>
   <section class="panel viewer"><div class="row" style="justify-content:space-between"><h3>Viewer</h3><div class="controls"><button class="btn" id="zoom-out">-</button><span>${v.viewerZoom || 120}%</span><button class="btn" id="zoom-in">+</button><button class="btn" id="portal-jump" ${selectedLocator ? '' : 'disabled'}>Jump to selected</button></div></div><div class="small">${selected?.title || 'No item selected'}</div><div class="small">${selectedLocator ? 'Location available' : 'location unavailable'}</div><div id="portal-viewer-content" class="viewer-doc"></div></section>
   <aside class="panel" style="padding:12px"><h3>Unit Meta</h3><div class="small">Source Type: ${source.sourceType}</div><div class="small">Priority: ${source.priority}</div><div class="small">Units: ${source.totalUnits}</div><div class="small">Queue On/Off via bars in outline.</div></aside></div>`;
 
