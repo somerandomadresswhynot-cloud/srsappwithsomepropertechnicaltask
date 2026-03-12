@@ -34,6 +34,10 @@ input, select, textarea { background:#12172f; color:var(--text); border:1px soli
 /* Portal */
 .portal { display:grid; grid-template-columns: 300px 1fr 320px; gap:12px; height:100%; }
 .outline-list { max-height:70vh; overflow:auto; padding:8px; }
+.outline-tools { display:flex; align-items:center; justify-content:space-between; padding:0 10px 6px; }
+.queue-master { width:14px; height:14px; border-radius:50%; border:1px solid var(--accent); background:var(--accent); cursor:pointer; }
+.queue-master.queue-off { box-shadow: 0 0 8px #70a0ffcc; }
+
 .outline-item { display:flex; align-items:center; justify-content:space-between; padding:6px; border-radius:8px; cursor:pointer; }
 .outline-item:hover { background:#27305a; }
 .outline-item.selected { background:#334077; }
