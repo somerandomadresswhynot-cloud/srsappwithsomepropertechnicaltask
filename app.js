@@ -17,9 +17,32 @@ function isLegacySeedData(data) {
   return Array.isArray(data?.sources) && data.sources.some(s => legacyTitles.includes(s.title));
 }
 
+function hydratePersistedState(persistedState) {
+  const base = defaultState();
+  if (!persistedState || typeof persistedState !== 'object') return base;
+
+  const data = persistedState.data && typeof persistedState.data === 'object' ? persistedState.data : {};
+  const view = persistedState.view && typeof persistedState.view === 'object' ? persistedState.view : {};
+
+  return {
+    data: {
+      sources: Array.isArray(data.sources) ? data.sources : [],
+      hierarchy: Array.isArray(data.hierarchy) ? data.hierarchy : [],
+      units: Array.isArray(data.units) ? data.units : [],
+      reviews: Array.isArray(data.reviews) ? data.reviews : [],
+      revisions: Array.isArray(data.revisions) ? data.revisions : []
+    },
+    view: {
+      page: typeof view.page === 'string' ? view.page : base.view.page,
+      sources: { ...base.view.sources, ...(view.sources || {}) },
+      portal: { ...base.view.portal, ...(view.portal || {}) },
+      queue: { ...base.view.queue, ...(view.queue || {}) }
+    }
+  };
+}
+
 const persisted = JSON.parse(localStorage.getItem('srs-app-state') || 'null');
-const state = persisted && !isLegacySeedData(persisted.data) ? persisted : defaultState();
-reconcileQueueFlagsFromHierarchy();
+const state = persisted && !isLegacySeedData(persisted.data) ? hydratePersistedState(persisted) : defaultState();
 normalizeQueueSelection();
 const importDraft = { file: null, parsedSections: [], parsing: false };
 
