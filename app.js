@@ -573,13 +573,33 @@ function renderPortal() {
   const outline = state.data.hierarchy.filter(h => h.sourceId === source.id);
   const filtered = outline.filter(h => !v.outlineSearchText || h.title.toLowerCase().includes(v.outlineSearchText.toLowerCase()));
   const selected = outline.find(h => h.id === v.selectedHierarchyItemId) || outline[0] || null;
+  const allInQueue = outline.length ? outline.every(item => item.inQueue) : true;
   if (!v.selectedHierarchyItemId && selected) v.selectedHierarchyItemId = selected.id;
 
-  pageRoot.innerHTML = `<div class="portal"><aside class="panel"><div style="padding:10px"><h3>${source.title}</h3><input id="outline-search" placeholder="Search outline" value="${v.outlineSearchText}"></div><div class="outline-list">${filtered.map(item => `<div class="outline-item ${item.id === selected?.id ? 'selected' : ''}" data-item="${item.id}"><div class="indent" style="--depth:${item.depth}">${item.isLeaf ? '📄' : '📁'} ${item.title}</div><div class="bars" title="toggle queue" data-toggle="${item.id}"><span class="bar ${item.inQueue ? 'fill inq' : 'fill off'}"></span><span class="bar ${item.inQueue ? 'fill inq' : 'fill off'}"></span><span class="bar ${item.inQueue ? 'fill inq' : 'fill off'}"></span></div></div>`).join('') || '<p class="small" style="padding:8px">No outline items.</p>'}</div></aside>
+  pageRoot.innerHTML = `<div class="portal"><aside class="panel"><div style="padding:10px"><h3>${source.title}</h3><input id="outline-search" placeholder="Search outline" value="${v.outlineSearchText}"></div><div class="outline-tools"><span class="small">Queue all</span><button class="queue-master ${allInQueue ? 'queue-on' : 'queue-off'}" id="toggle-all-queue" title="${allInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue'}" aria-label="${allInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue'}"></button></div><div class="outline-list">${filtered.map(item => `<div class="outline-item ${item.id === selected?.id ? 'selected' : ''}" data-item="${item.id}"><div class="indent" style="--depth:${item.depth}">${item.isLeaf ? '📄' : '📁'} ${item.title}</div>${renderQueueBars(item)}</div>`).join('') || '<p class="small" style="padding:8px">No outline items.</p>'}</div></aside>
   <section class="panel viewer"><div class="row" style="justify-content:space-between"><h3>Viewer</h3><div class="controls"><button class="btn" id="zoom-out">-</button><span>${v.viewerZoom || 120}%</span><button class="btn" id="zoom-in">+</button></div></div><div class="small">${source.sourceType === 'pdf' ? `PDF Page ${selected?.pageStart || v.viewerPage}` : `Time ${selected?.timeStartSec || 0}s`}</div><div class="viewer-doc" style="font-size:${(v.viewerZoom || 120) / 100}em"><h2>${selected?.title || 'No item selected'}</h2><p>Simulated embedded source viewer region. In production this panel maps to actual PDF/video location and allows highlighting.</p></div></section>
   <aside class="panel" style="padding:12px"><h3>Unit Meta</h3><div class="small">Source Type: ${source.sourceType}</div><div class="small">Priority: ${source.priority}</div><div class="small">Units: ${source.totalUnits}</div><div class="small">Queue On/Off via bars in outline.</div></aside></div>`;
 
   document.getElementById('outline-search').oninput = e => { v.outlineSearchText = e.target.value; renderPortal(); save(); };
+  document.getElementById('toggle-all-queue').onclick = () => {
+    const nextState = !outline.every(item => item.inQueue);
+    applyQueueStateForItems(outline, nextState);
+    document.querySelectorAll('.outline-item .bars').forEach(node => {
+      const id = node.dataset.toggle;
+      const item = state.data.hierarchy.find(x => x.id === id);
+      if (!item) return;
+      node.outerHTML = renderQueueBars(item);
+    });
+    document.querySelectorAll('[data-toggle]').forEach(el => el.onclick = onToggleQueue);
+    const toggleAll = document.getElementById('toggle-all-queue');
+    if (toggleAll) {
+      toggleAll.classList.toggle('queue-on', nextState);
+      toggleAll.classList.toggle('queue-off', !nextState);
+      toggleAll.title = nextState ? 'Turn all OFF in queue' : 'Turn all ON in queue';
+      toggleAll.setAttribute('aria-label', toggleAll.title);
+    }
+    save();
+  };
   document.querySelectorAll('[data-item]').forEach(el => el.onclick = () => {
     v.selectedHierarchyItemId = el.dataset.item;
     const item = outline.find(x => x.id === v.selectedHierarchyItemId);
@@ -588,22 +608,68 @@ function renderPortal() {
     renderPortal();
     save();
   });
-  document.querySelectorAll('[data-toggle]').forEach(el => el.onclick = e => {
+
+  const onToggleQueue = e => {
     e.stopPropagation();
-    const i = state.data.hierarchy.find(x => x.id === el.dataset.toggle);
+    const toggleId = e.currentTarget?.dataset.toggle;
+    const i = state.data.hierarchy.find(x => x.id === toggleId);
+    if (!i) return;
+
     const nextState = !i.inQueue;
-    const affected = new Set([i.id, ...getDescendantIds(i.id, state.data.hierarchy.filter(x => x.sourceId === i.sourceId))]);
-    state.data.hierarchy.forEach(node => {
-      if (affected.has(node.id)) node.inQueue = nextState;
+    const related = state.data.hierarchy.filter(x => x.sourceId === i.sourceId);
+    const affected = new Set([i.id, ...getDescendantIds(i.id, related)]);
+
+    const affectedItems = related.filter(node => affected.has(node.id));
+    applyQueueStateForItems(affectedItems, nextState);
+
+    affected.forEach(id => {
+      const target = document.querySelector(`[data-item="${id}"] .bars`);
+      const node = state.data.hierarchy.find(x => x.id === id);
+      if (!target || !node) return;
+      target.outerHTML = renderQueueBars(node);
+      const replacement = document.querySelector(`[data-item="${id}"] .bars`);
+      if (replacement) replacement.onclick = onToggleQueue;
     });
-    state.data.units.forEach(unit => {
-      if (affected.has(unit.hierarchyId)) unit.inQueue = nextState;
-    });
-    renderPortal();
+
+    const toggleAll = document.getElementById('toggle-all-queue');
+    const sourceItems = state.data.hierarchy.filter(node => node.sourceId === i.sourceId);
+    const sourceAllInQueue = sourceItems.length ? sourceItems.every(node => node.inQueue) : true;
+    if (toggleAll) {
+      toggleAll.classList.toggle('queue-on', sourceAllInQueue);
+      toggleAll.classList.toggle('queue-off', !sourceAllInQueue);
+      toggleAll.title = sourceAllInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue';
+      toggleAll.setAttribute('aria-label', toggleAll.title);
+    }
+
     save();
-  });
+  };
+
+  document.querySelectorAll('[data-toggle]').forEach(el => el.onclick = onToggleQueue);
   document.getElementById('zoom-in').onclick = () => { v.viewerZoom = Math.min(200, (v.viewerZoom || 120) + 10); renderPortal(); save(); };
   document.getElementById('zoom-out').onclick = () => { v.viewerZoom = Math.max(50, (v.viewerZoom || 120) - 10); renderPortal(); save(); };
+}
+
+function applyQueueStateForItems(items, nextState) {
+  const itemIds = new Set(items.map(item => item.id));
+  state.data.hierarchy.forEach(node => {
+    if (itemIds.has(node.id)) node.inQueue = nextState;
+  });
+  state.data.units.forEach(unit => {
+    if (itemIds.has(unit.hierarchyId)) unit.inQueue = nextState;
+  });
+}
+
+function renderQueueBars(item) {
+  const filledBars = getFilledBarsCount(item.studyState);
+  const queueClass = item.inQueue ? 'queue-on' : 'queue-off';
+  const bars = [0, 1].map(index => `<span class="bar ${index < filledBars ? 'fill' : ''} ${queueClass}"></span>`).join('');
+  return `<div class="bars ${queueClass}" title="toggle queue" data-toggle="${item.id}">${bars}</div>`;
+}
+
+function getFilledBarsCount(studyState) {
+  if (studyState === 'started') return 1;
+  if (studyState === 'mastered') return 2;
+  return 0;
 }
 
 let timer;
