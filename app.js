@@ -71,26 +71,53 @@ function importSourceFromForm() {
 function autoParseSource(source, parsedSections = []) {
   const sections = parsedSections.length
     ? parsedSections
-    : ['Introduction', 'Core Concepts', 'Examples', 'Practice', 'Summary'].map((title, idx) => ({ title, pageStart: idx * 10 + 1 }));
-
-  const addedHierarchy = sections.flatMap((section, idx) => {
-    const parentId = crypto.randomUUID();
-    const leafId = crypto.randomUUID();
-    const pageStart = section.pageStart || idx * 10 + 1;
-    return [
-      { id: parentId, sourceId: source.id, parentId: null, title: section.title, depth: 0, isLeaf: false, studyState: 'unstudied', inQueue: true, pageStart, pageEnd: pageStart + 4 },
-      { id: leafId, sourceId: source.id, parentId, title: `${section.title} — Review Unit`, depth: 1, isLeaf: true, studyState: 'unstudied', inQueue: true, pageStart, pageEnd: pageStart + 2 }
+    : [
+      { title: 'Chapter 1 Introduction', pageStart: 1, level: 0 },
+      { title: 'Section 1.1 Core Concepts', pageStart: 3, level: 1 },
+      { title: 'Subsection 1.1.1 Examples', pageStart: 6, level: 2 },
+      { title: 'Section 1.2 Practice', pageStart: 9, level: 1 },
+      { title: 'Chapter 2 Summary', pageStart: 13, level: 0 }
     ];
+
+  const normalized = sections.map((section, idx) => ({
+    title: section.title,
+    pageStart: section.pageStart || idx * 5 + 1,
+    level: Number.isInteger(section.level) ? Math.max(0, Math.min(2, section.level)) : 0
+  }));
+
+  const parentStack = [];
+  const addedHierarchy = normalized.map((node, idx) => {
+    parentStack.length = node.level;
+    const parentId = parentStack[parentStack.length - 1] || null;
+    const id = crypto.randomUUID();
+    parentStack.push(id);
+    const pageEnd = normalized[idx + 1]?.pageStart ? Math.max(node.pageStart, normalized[idx + 1].pageStart - 1) : node.pageStart + 3;
+    return {
+      id,
+      sourceId: source.id,
+      parentId,
+      title: node.title,
+      depth: node.level,
+      isLeaf: false,
+      studyState: 'unstudied',
+      inQueue: true,
+      pageStart: node.pageStart,
+      pageEnd
+    };
   });
+
+  const parentIds = new Set(addedHierarchy.filter(item => item.parentId).map(item => item.parentId));
+  addedHierarchy.forEach(item => { item.isLeaf = !parentIds.has(item.id); });
   state.data.hierarchy.push(...addedHierarchy);
 
   const addedUnits = addedHierarchy.filter(x => x.isLeaf).map((leaf, i) => ({
     id: crypto.randomUUID(),
     title: leaf.title,
+    hierarchyId: leaf.id,
     sourceId: source.id,
     sourceTitle: source.title,
     sourceType: source.sourceType,
-    fullPath: [leaf.title.replace(' — Review Unit', '')],
+    fullPath: getHierarchyPath(leaf.id, addedHierarchy),
     pageStart: source.sourceType === 'pdf' ? leaf.pageStart : undefined,
     pageEnd: source.sourceType === 'pdf' ? leaf.pageEnd : undefined,
     timeStartSec: source.sourceType !== 'pdf' ? i * 180 : undefined,
@@ -113,8 +140,9 @@ async function parsePdfHeaders(file) {
   const arrayBuffer = await file.arrayBuffer();
   const task = window.pdfjsLib.getDocument({ data: arrayBuffer });
   const pdf = await task.promise;
-  const pageCap = Math.min(pdf.numPages, 25);
+  const pageCap = Math.min(pdf.numPages, 40);
   const candidates = [];
+  const tocCandidates = [];
 
   for (let pageNo = 1; pageNo <= pageCap; pageNo += 1) {
     const page = await pdf.getPage(pageNo);
@@ -137,40 +165,124 @@ async function parsePdfHeaders(file) {
       const ordered = lineItems.sort((a, b) => a.x - b.x);
       const textLine = ordered.map(i => i.str).join(' ').replace(/\s+/g, ' ').trim();
       const avgSize = ordered.reduce((sum, i) => sum + i.size, 0) / ordered.length;
-      return { text: textLine, avgSize, y: bucketY };
+      const minX = Math.min(...ordered.map(i => i.x));
+      return { text: textLine, avgSize, y: bucketY, minX };
     });
 
     const sizeValues = lines.map(line => line.avgSize).sort((a, b) => a - b);
     const medianSize = sizeValues[Math.floor(sizeValues.length / 2)] || 10;
+
+    const tocEntries = extractTocEntries(lines);
+    if (tocEntries.length >= 6) tocCandidates.push(...tocEntries);
 
     lines.forEach(line => {
       const cleaned = line.text.replace(/^[-•\d.\s]+/, '').trim();
       if (cleaned.length < 4 || cleaned.length > 90) return;
       const words = cleaned.split(/\s+/);
       let score = 0;
-      if (/^(chapter|section|part)\s+\d+/i.test(line.text)) score += 3;
-      if (/^\d+(\.\d+)*\s+[A-Za-z]/.test(line.text)) score += 2;
+      if (/^(chapter|section|subsection|part)\s+\d+/i.test(line.text)) score += 3;
+      if (/^\d+(\.\d+){0,2}\s+[A-Za-z]/.test(line.text)) score += 3;
       if (line.avgSize >= medianSize + 1) score += 2;
       if (words.length <= 10) score += 1;
       if (/^[A-Z0-9\s:,-]+$/.test(cleaned) && words.length <= 8) score += 1;
       if (/^([A-Z][\w'-]+\s){1,9}[A-Z][\w'-]+$/.test(cleaned)) score += 1;
-      if (score >= 3) candidates.push({ title: cleaned, pageStart: pageNo, score });
+      if (score >= 3) {
+        candidates.push({ title: cleaned, pageStart: pageNo, score, level: inferHeaderLevel(cleaned, line.avgSize, medianSize) });
+      }
     });
   }
 
+  if (tocCandidates.length >= 8) {
+    const dedup = dedupeCandidates(tocCandidates, c => `${c.title.toLowerCase()}|${c.pageStart}`);
+    return dedup
+      .sort((a, b) => a.pageStart - b.pageStart || a.level - b.level)
+      .slice(0, 80);
+  }
+
+  const unique = dedupeCandidates(
+    candidates.sort((a, b) => b.score - a.score || a.pageStart - b.pageStart),
+    c => c.title.toLowerCase()
+  );
+
+  return unique.slice(0, 24).sort((a, b) => a.pageStart - b.pageStart || a.level - b.level);
+}
+
+function extractTocEntries(lines) {
+  const entryRegex = /^(.*?)\s(?:\.{2,}\s*|\s)(\d{1,4})$/;
+  const tocLines = lines
+    .map(line => {
+      const match = line.text.match(entryRegex);
+      if (!match) return null;
+      const rawTitle = match[1].replace(/[•·]+/g, ' ').replace(/\s+/g, ' ').trim();
+      const pageStart = Number(match[2]);
+      if (!rawTitle || rawTitle.length < 3 || rawTitle.length > 120 || Number.isNaN(pageStart)) return null;
+      if (/^(index|references|bibliography)$/i.test(rawTitle)) return null;
+      return { title: rawTitle, pageStart, minX: line.minX };
+    })
+    .filter(Boolean);
+
+  if (!tocLines.length) return [];
+  const baseX = Math.min(...tocLines.map(line => line.minX));
+
+  return tocLines.map(entry => ({
+    title: entry.title,
+    pageStart: entry.pageStart,
+    score: 10,
+    level: inferHeaderLevel(entry.title, 0, 0, entry.minX - baseX)
+  }));
+}
+
+function dedupeCandidates(list, keyFn) {
   const unique = [];
   const seen = new Set();
-  candidates
-    .sort((a, b) => b.score - a.score || a.pageStart - b.pageStart)
-    .forEach(candidate => {
-      const key = candidate.title.toLowerCase();
-      if (!seen.has(key)) {
-        seen.add(key);
-        unique.push(candidate);
-      }
-    });
+  list.forEach(candidate => {
+    const key = keyFn(candidate);
+    if (seen.has(key)) return;
+    seen.add(key);
+    unique.push(candidate);
+  });
+  return unique;
+}
 
-  return unique.slice(0, 10).sort((a, b) => a.pageStart - b.pageStart);
+function inferHeaderLevel(title, avgSize, medianSize, indentOffset = 0) {
+  if (/^(chapter|part)\s+/i.test(title)) return 0;
+  if (/^section\s+/i.test(title)) return 1;
+  if (/^subsection\s+/i.test(title)) return 2;
+  const numberingMatch = title.match(/^(\d+(?:\.\d+){0,2})\b/);
+  if (numberingMatch) {
+    const parts = numberingMatch[1].split('.').length;
+    return Math.max(0, Math.min(2, parts - 1));
+  }
+  if (indentOffset > 28) return 2;
+  if (indentOffset > 12) return 1;
+  if (medianSize <= 0) return 0;
+  if (avgSize >= medianSize + 3) return 0;
+  if (avgSize >= medianSize + 1) return 1;
+  return 2;
+}
+
+function getHierarchyPath(itemId, allHierarchy) {
+  const byId = new Map(allHierarchy.map(item => [item.id, item]));
+  const path = [];
+  let cursor = byId.get(itemId);
+  while (cursor) {
+    path.unshift(cursor.title);
+    cursor = cursor.parentId ? byId.get(cursor.parentId) : null;
+  }
+  return path;
+}
+
+function getDescendantIds(itemId, hierarchy) {
+  const descendants = [];
+  const stack = [itemId];
+  while (stack.length) {
+    const parent = stack.pop();
+    hierarchy.filter(item => item.parentId === parent).forEach(child => {
+      descendants.push(child.id);
+      stack.push(child.id);
+    });
+  }
+  return descendants;
 }
 
 async function processImportedFile(file) {
@@ -193,7 +305,7 @@ async function processImportedFile(file) {
   status.textContent = 'Parsing PDF headers…';
   try {
     const headers = await parsePdfHeaders(file);
-    importDraft.parsedSections = headers.map(h => ({ title: h.title, pageStart: h.pageStart }));
+    importDraft.parsedSections = headers.map(h => ({ title: h.title, pageStart: h.pageStart, level: h.level }));
     status.textContent = headers.length
       ? `Detected ${headers.length} candidate headers: ${headers.slice(0, 3).map(h => h.title).join(', ')}${headers.length > 3 ? '…' : ''}`
       : 'No strong headers detected; default sections will be used.';
@@ -386,7 +498,7 @@ function renderPortal() {
   const selected = outline.find(h => h.id === v.selectedHierarchyItemId) || outline[0] || null;
   if (!v.selectedHierarchyItemId && selected) v.selectedHierarchyItemId = selected.id;
 
-  pageRoot.innerHTML = `<div class="portal"><aside class="panel"><div style="padding:10px"><h3>${source.title}</h3><input id="outline-search" placeholder="Search outline" value="${v.outlineSearchText}"></div><div class="outline-list">${filtered.map(item => `<div class="outline-item ${item.id === selected?.id ? 'selected' : ''}" data-item="${item.id}"><div class="indent" style="--depth:${item.depth}">${item.isLeaf ? '📄' : '📁'} ${item.title}</div><div class="bars" title="toggle queue" data-toggle="${item.id}"><span class="bar ${item.inQueue ? 'fill inq' : ''}"></span><span class="bar ${item.inQueue ? 'fill inq' : ''}"></span><span class="bar ${item.inQueue ? 'fill inq' : ''}"></span></div></div>`).join('') || '<p class="small" style="padding:8px">No outline items.</p>'}</div></aside>
+  pageRoot.innerHTML = `<div class="portal"><aside class="panel"><div style="padding:10px"><h3>${source.title}</h3><input id="outline-search" placeholder="Search outline" value="${v.outlineSearchText}"></div><div class="outline-list">${filtered.map(item => `<div class="outline-item ${item.id === selected?.id ? 'selected' : ''}" data-item="${item.id}"><div class="indent" style="--depth:${item.depth}">${item.isLeaf ? '📄' : '📁'} ${item.title}</div><div class="bars" title="toggle queue" data-toggle="${item.id}"><span class="bar ${item.inQueue ? 'fill inq' : 'fill off'}"></span><span class="bar ${item.inQueue ? 'fill inq' : 'fill off'}"></span><span class="bar ${item.inQueue ? 'fill inq' : 'fill off'}"></span></div></div>`).join('') || '<p class="small" style="padding:8px">No outline items.</p>'}</div></aside>
   <section class="panel viewer"><div class="row" style="justify-content:space-between"><h3>Viewer</h3><div class="controls"><button class="btn" id="zoom-out">-</button><span>${v.viewerZoom || 120}%</span><button class="btn" id="zoom-in">+</button></div></div><div class="small">${source.sourceType === 'pdf' ? `PDF Page ${selected?.pageStart || v.viewerPage}` : `Time ${selected?.timeStartSec || 0}s`}</div><div class="viewer-doc" style="font-size:${(v.viewerZoom || 120) / 100}em"><h2>${selected?.title || 'No item selected'}</h2><p>Simulated embedded source viewer region. In production this panel maps to actual PDF/video location and allows highlighting.</p></div></section>
   <aside class="panel" style="padding:12px"><h3>Unit Meta</h3><div class="small">Source Type: ${source.sourceType}</div><div class="small">Priority: ${source.priority}</div><div class="small">Units: ${source.totalUnits}</div><div class="small">Queue On/Off via bars in outline.</div></aside></div>`;
 
@@ -394,7 +506,7 @@ function renderPortal() {
   document.querySelectorAll('[data-item]').forEach(el => el.onclick = () => {
     v.selectedHierarchyItemId = el.dataset.item;
     const item = outline.find(x => x.id === v.selectedHierarchyItemId);
-    const unit = state.data.units.find(u => u.sourceId === source.id && u.title.startsWith(item.title));
+    const unit = state.data.units.find(u => u.sourceId === source.id && u.hierarchyId === item.id);
     if (unit) state.view.queue.selectedUnitId = unit.id;
     renderPortal();
     save();
@@ -402,9 +514,14 @@ function renderPortal() {
   document.querySelectorAll('[data-toggle]').forEach(el => el.onclick = e => {
     e.stopPropagation();
     const i = state.data.hierarchy.find(x => x.id === el.dataset.toggle);
-    i.inQueue = !i.inQueue;
-    const unit = state.data.units.find(u => u.sourceId === i.sourceId && u.title.startsWith(i.title));
-    if (unit) unit.inQueue = i.inQueue;
+    const nextState = !i.inQueue;
+    const affected = new Set([i.id, ...getDescendantIds(i.id, state.data.hierarchy.filter(x => x.sourceId === i.sourceId))]);
+    state.data.hierarchy.forEach(node => {
+      if (affected.has(node.id)) node.inQueue = nextState;
+    });
+    state.data.units.forEach(unit => {
+      if (affected.has(unit.hierarchyId)) unit.inQueue = nextState;
+    });
     renderPortal();
     save();
   });
