@@ -150,6 +150,7 @@ const viewerPdfBytesCache = new Map();
 const viewerPdfPageCache = new Map();
 const viewerPdfRenderCache = new Map();
 const viewerAssetUrlCache = new Map();
+const viewerInstanceCache = new Map();
 
 const PDF_BYTES_BUDGET = 150 * 1024 * 1024;
 const PDF_RENDER_BUDGET = 64 * 1024 * 1024;
@@ -235,6 +236,9 @@ async function deleteAssetBlob(assetId) {
   }
   for (const renderKey of [...viewerPdfRenderCache.keys()]) {
     if (renderKey.startsWith(`${pdfCacheKey}:`)) viewerPdfRenderCache.delete(renderKey);
+  }
+  for (const controller of viewerInstanceCache.values()) {
+    if (controller?.clearSourceKey) controller.clearSourceKey(pdfCacheKey);
   }
 }
 
@@ -541,7 +545,7 @@ function getLocatorForUnit(unit) {
   };
 }
 
-function createViewerController(source, containerEl) {
+function createViewerController(source, containerEl, options = {}) {
   if (!source || !containerEl) {
     return {
       goToPage: () => {},
@@ -552,14 +556,23 @@ function createViewerController(source, containerEl) {
   }
 
   if (source.sourceType === 'pdf') {
+    const controller = getOrCreatePdfViewerController(options.viewerKey || 'inline');
+    controller.mount(containerEl);
     return {
       goToPage(page) {
         if (!Number.isFinite(page)) return;
-        state.view.portal.viewerPage = Math.max(1, Math.floor(page));
+        const safePage = Math.max(1, Math.floor(page));
+        state.view.portal.viewerPage = safePage;
+        controller.goToPage(safePage);
+      },
+      setZoom(zoomPercent) {
+        if (!Number.isFinite(zoomPercent)) return;
+        controller.setZoom(zoomPercent);
       },
       seekTo: () => {},
       getPosition() {
-        return { kind: 'page', page: state.view.portal.viewerPage || 1 };
+        const page = controller.getCurrentPage() || state.view.portal.viewerPage || 1;
+        return { kind: 'page', page };
       },
       hasLocator(locator) {
         return Boolean(locator && locator.kind === 'page' && Number.isFinite(locator.page));
@@ -623,6 +636,103 @@ function createViewerController(source, containerEl) {
       return Boolean(locator);
     }
   };
+}
+
+function buildPdfViewerUrl(fileUrl, page, zoomPercent) {
+  const params = new URLSearchParams();
+  params.set('page', String(Math.max(1, Math.floor(page || 1))));
+  params.set('zoom', String(Math.max(50, Math.floor(zoomPercent || 120))));
+  return `${fileUrl}#${params.toString()}`;
+}
+
+function getOrCreatePdfViewerController(viewerKey) {
+  if (viewerInstanceCache.has(viewerKey)) return viewerInstanceCache.get(viewerKey);
+
+  const shell = document.createElement('div');
+  shell.className = 'pdf-native-viewer-shell';
+  shell.innerHTML = `<div class="viewer-location"></div><iframe class="pdf-native-frame" title="PDF viewer" loading="lazy"></iframe>`;
+  const locationEl = shell.querySelector('.viewer-location');
+  const frameEl = shell.querySelector('iframe.pdf-native-frame');
+
+  const controller = {
+    viewerKey,
+    shell,
+    locationEl,
+    frameEl,
+    mountedContainer: null,
+    sourceKey: null,
+    fileUrl: null,
+    totalPages: null,
+    currentPage: 1,
+    zoomPercent: 120,
+    mount(containerEl) {
+      if (!containerEl || this.mountedContainer === containerEl) return;
+      containerEl.innerHTML = '';
+      containerEl.appendChild(this.shell);
+      this.mountedContainer = containerEl;
+    },
+    open({ sourceKey, fileUrl, page, zoomPercent, totalPages }) {
+      const safePage = Math.max(1, Math.floor(page || 1));
+      const safeZoom = Math.max(50, Math.floor(zoomPercent || 120));
+      const sourceChanged = this.sourceKey !== sourceKey || this.fileUrl !== fileUrl;
+      const pageChanged = this.currentPage !== safePage;
+      const zoomChanged = this.zoomPercent !== safeZoom;
+
+      this.sourceKey = sourceKey;
+      this.fileUrl = fileUrl;
+      this.totalPages = totalPages;
+      this.currentPage = safePage;
+      this.zoomPercent = safeZoom;
+      this.locationEl.textContent = `PDF page ${safePage} of ${totalPages}`;
+
+      if (sourceChanged) {
+        this.frameEl.src = buildPdfViewerUrl(fileUrl, safePage, safeZoom);
+        return;
+      }
+
+      if (!pageChanged && !zoomChanged) return;
+      this.navigate(safePage, safeZoom);
+    },
+    navigate(page, zoomPercent) {
+      const safePage = Math.max(1, Math.floor(page || 1));
+      const safeZoom = Math.max(50, Math.floor(zoomPercent || 120));
+      this.currentPage = safePage;
+      this.zoomPercent = safeZoom;
+      this.locationEl.textContent = `PDF page ${safePage} of ${this.totalPages || '?'}`;
+      if (!this.frameEl.contentWindow) return;
+      try {
+        this.frameEl.contentWindow.location.replace(`#page=${safePage}&zoom=${safeZoom}`);
+      } catch {
+        this.frameEl.src = buildPdfViewerUrl(this.fileUrl, safePage, safeZoom);
+      }
+    },
+    goToPage(page) {
+      this.navigate(page, this.zoomPercent);
+    },
+    setZoom(zoomPercent) {
+      this.navigate(this.currentPage, zoomPercent);
+    },
+    getCurrentPage() {
+      return this.currentPage;
+    },
+    clearSourceKey(cacheKey) {
+      if (this.sourceKey !== cacheKey) return;
+      this.sourceKey = null;
+      this.fileUrl = null;
+      this.totalPages = null;
+      this.currentPage = 1;
+      this.frameEl.removeAttribute('src');
+      this.locationEl.textContent = '';
+    },
+    dispose() {
+      this.frameEl.removeAttribute('src');
+      if (this.shell.parentElement) this.shell.parentElement.removeChild(this.shell);
+      this.mountedContainer = null;
+    }
+  };
+
+  viewerInstanceCache.set(viewerKey, controller);
+  return controller;
 }
 
 function syncSelectionAcrossPortalAndQueue(source, hierarchyItem, unit) {
@@ -761,18 +871,11 @@ async function renderPdfPageToCanvas({ pdf, sourceKey, pageNumber, scale, target
 }
 
 async function renderPdfViewer(source, selectedUnitOrOutlineItem, containerEl, options = {}) {
-  const renderToken = `${Date.now()}-${Math.random()}`;
-  containerEl.dataset.renderToken = renderToken;
-
   try {
     const pdfCacheKey = getPdfSourceCacheKey(source);
-    let pageWrap = containerEl.querySelector('.pdf-page-wrap');
-    let canvas = containerEl.querySelector('canvas.pdf-canvas');
-    let locationEl = containerEl.querySelector('.viewer-location');
-
-    if (!pageWrap || !canvas || !locationEl || containerEl.dataset.pdfSourceCacheKey !== pdfCacheKey) {
-      containerEl.innerHTML = '<div class="small">Loading PDF preview…</div>';
-    }
+    const viewerKey = options.viewerKey || 'inline';
+    const controller = getOrCreatePdfViewerController(viewerKey);
+    controller.mount(containerEl);
 
     let totalPages = viewerPdfPageCountCache.get(pdfCacheKey);
     const pdf = await loadPdfDocument(source);
@@ -788,29 +891,15 @@ async function renderPdfViewer(source, selectedUnitOrOutlineItem, containerEl, o
         : 1;
 
     const pageNumber = clamp(Math.floor(requestedPage), 1, totalPages);
-    const scale = clamp((options.zoomPercent || 120) / 100, 0.5, 2.4);
-
-    if (containerEl.dataset.renderToken !== renderToken) return;
-
-    if (!pageWrap || !canvas || !locationEl || containerEl.dataset.pdfSourceCacheKey !== pdfCacheKey) {
-      containerEl.dataset.pdfSourceCacheKey = pdfCacheKey;
-      containerEl.innerHTML = `<div class="viewer-location">PDF page ${pageNumber} of ${totalPages}</div><div class="pdf-page-wrap"><canvas class="pdf-canvas"></canvas></div>`;
-      locationEl = containerEl.querySelector('.viewer-location');
-      pageWrap = containerEl.querySelector('.pdf-page-wrap');
-      canvas = containerEl.querySelector('canvas.pdf-canvas');
-    } else {
-      locationEl.textContent = `PDF page ${pageNumber} of ${totalPages}`;
-    }
-
-    await renderPdfPageToCanvas({
-      pdf,
+    const sourceUrl = source.assetId ? await getAssetObjectUrl(source.assetId) : source.origin;
+    if (!sourceUrl) throw new Error('Stored PDF file is missing. Re-upload this source from Sources page.');
+    controller.open({
       sourceKey: pdfCacheKey,
-      pageNumber,
-      scale,
-      targetCanvas: canvas
+      fileUrl: sourceUrl,
+      page: pageNumber,
+      zoomPercent: options.zoomPercent || 120,
+      totalPages
     });
-
-    pageWrap.style.width = `${canvas.width}px`;
   } catch (error) {
     renderUnsupportedViewer(source, containerEl, `Unable to render PDF preview: ${error.message}`);
   }
@@ -896,6 +985,32 @@ const importDraft = {
 
 const save = () => localStorage.setItem('srs-app-state', JSON.stringify(state));
 const pageRoot = document.getElementById('page-root');
+const persistentViewerHosts = new Map();
+const viewerHostParkingLot = document.createElement('div');
+
+function getPersistentViewerHost(surfaceKey) {
+  if (persistentViewerHosts.has(surfaceKey)) return persistentViewerHosts.get(surfaceKey);
+  const host = document.createElement('div');
+  host.className = 'viewer-doc';
+  host.dataset.surface = surfaceKey;
+  persistentViewerHosts.set(surfaceKey, host);
+  return host;
+}
+
+function parkPersistentViewerHost(surfaceKey) {
+  const host = persistentViewerHosts.get(surfaceKey);
+  if (!host || host.parentElement === viewerHostParkingLot) return;
+  viewerHostParkingLot.appendChild(host);
+}
+
+function restorePersistentViewerHost(surfaceKey, slotId) {
+  const slot = document.getElementById(slotId);
+  if (!slot) return null;
+  const host = getPersistentViewerHost(surfaceKey);
+  slot.replaceWith(host);
+  return host;
+}
+
 const navButtons = [...document.querySelectorAll('.nav-btn')];
 navButtons.forEach(b => b.onclick = () => { state.view.page = b.dataset.page; render(); save(); });
 
@@ -1704,6 +1819,7 @@ function renderPortal() {
   const v = state.view.portal;
   const source = state.data.sources.find(s => s.id === v.sourceId) || state.data.sources[0] || null;
   if (!source) {
+    parkPersistentViewerHost('portal');
     pageRoot.innerHTML = `<section class="panel" style="padding:16px"><h2>Source Portal</h2><p class="small">No source loaded. Import from Sources first.</p></section>`;
     return;
   }
@@ -1722,16 +1838,18 @@ function renderPortal() {
   const allInQueue = outline.length ? outline.every(item => item.inQueue) : true;
   if (!v.selectedHierarchyItemId && selected) v.selectedHierarchyItemId = selected.id;
 
+  parkPersistentViewerHost('portal');
   pageRoot.innerHTML = `<div class="portal"><aside class="panel"><div style="padding:10px"><h3>${source.title}</h3><input id="outline-search" placeholder="Search outline" value="${v.outlineSearchText}"></div><div class="outline-tools"><span class="small">Queue all</span><button class="queue-master ${allInQueue ? 'queue-on' : 'queue-off'}" id="toggle-all-queue" title="${allInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue'}" aria-label="${allInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue'}"></button></div><div class="outline-list">${filtered.map(item => `<div class="outline-item ${item.id === selected?.id ? 'selected' : ''}" data-item="${item.id}"><div><div class="indent" style="--depth:${item.depth}">${item.isLeaf ? '📄' : '📁'} ${item.title}</div>${formatRangeLabel(item) ? `<div class="small" style="padding-left:${Math.min(item.depth + 1, 6) * 16}px">${formatRangeLabel(item)}</div>` : ''}</div>${renderQueueBars(item)}</div>`).join('') || '<p class="small" style="padding:8px">No outline items.</p>'}</div></aside>
-  <section class="panel viewer"><div class="row" style="justify-content:space-between"><h3>Viewer</h3><div class="controls"><button class="btn" id="zoom-out">-</button><span id="portal-zoom-label">${v.viewerZoom || 120}%</span><button class="btn" id="zoom-in">+</button><button class="btn" id="portal-jump" ${selectedLocator ? '' : 'disabled'}>Jump to selected</button></div></div><div class="small" id="portal-selected-title">${selected?.title || 'No item selected'}</div><div class="small" id="portal-selected-location">${selectedLocator ? 'Location available' : 'location unavailable'}</div><div id="portal-viewer-content" class="viewer-doc"></div></section>
+  <section class="panel viewer"><div class="row" style="justify-content:space-between"><h3>Viewer</h3><div class="controls"><button class="btn" id="zoom-out">-</button><span id="portal-zoom-label">${v.viewerZoom || 120}%</span><button class="btn" id="zoom-in">+</button><button class="btn" id="portal-jump" ${selectedLocator ? '' : 'disabled'}>Jump to selected</button></div></div><div class="small" id="portal-selected-title">${selected?.title || 'No item selected'}</div><div class="small" id="portal-selected-location">${selectedLocator ? 'Location available' : 'location unavailable'}</div><div id="portal-viewer-slot"></div></section>
   <aside class="panel" style="padding:12px"><h3>Unit Meta</h3><div class="small">Source Type: ${source.sourceType}</div><div class="small">Priority: ${source.priority}</div><div class="small">Units: ${source.totalUnits}</div><div class="small">Queue On/Off via bars in outline.</div></aside></div>`;
 
-  const viewerEl = document.getElementById('portal-viewer-content');
+  const viewerEl = restorePersistentViewerHost('portal', 'portal-viewer-slot');
   renderSourceViewer(source, selectedUnit || selected, viewerEl, {
+    viewerKey: 'portal',
     zoomPercent: v.viewerZoom || 120,
     defaultPage: v.viewerPage || 1
   });
-  const controller = createViewerController(source, viewerEl);
+  const controller = createViewerController(source, viewerEl, { viewerKey: 'portal' });
 
   document.getElementById('outline-search').oninput = e => { v.outlineSearchText = e.target.value; renderPortal(); save(); };
   document.getElementById('toggle-all-queue').onclick = () => {
@@ -1760,6 +1878,7 @@ function renderPortal() {
     });
 
     renderSourceViewer(source, unit || item, viewerEl, {
+      viewerKey: 'portal',
       zoomPercent: v.viewerZoom || 120,
       defaultPage: v.viewerPage || 1
     });
@@ -1777,6 +1896,7 @@ function renderPortal() {
     if (activeLocator.kind === 'time') controller.seekTo(activeLocator.seconds);
 
     renderSourceViewer(source, activeUnit || activeItem, viewerEl, {
+      viewerKey: 'portal',
       zoomPercent: v.viewerZoom || 120,
       defaultPage: v.viewerPage || 1
     });
@@ -1807,6 +1927,7 @@ function renderPortal() {
     const zoomLabel = document.getElementById('portal-zoom-label');
     if (zoomLabel) zoomLabel.textContent = `${v.viewerZoom}%`;
     renderSourceViewer(source, selectedItemUnit || selectedItem, viewerEl, {
+      viewerKey: 'portal',
       zoomPercent: v.viewerZoom || 120,
       defaultPage: v.viewerPage || 1
     });
@@ -1819,6 +1940,7 @@ function renderPortal() {
     const zoomLabel = document.getElementById('portal-zoom-label');
     if (zoomLabel) zoomLabel.textContent = `${v.viewerZoom}%`;
     renderSourceViewer(source, selectedItemUnit || selectedItem, viewerEl, {
+      viewerKey: 'portal',
       zoomPercent: v.viewerZoom || 120,
       defaultPage: v.viewerPage || 1
     });
@@ -1871,17 +1993,19 @@ function renderQueue() {
   const queueHierarchyItem = u ? state.data.hierarchy.find(item => item.id === u.hierarchyId) || null : null;
   const queueLocator = getLocatorForUnit(u) || getLocatorForHierarchyItem(queueSource, queueHierarchyItem);
 
+  parkPersistentViewerHost('queue');
   pageRoot.innerHTML = `<div class="queue"><aside class="panel queue-list"><h2>Study Queue</h2>${units.length ? units.map(x => `<div class="queue-item ${x.id === u?.id ? 'active' : ''}" data-unit="${x.id}"><strong>${x.title}</strong><div class="small">${x.sourceTitle} • ${x.sizeLabel}</div><div>${x.retentionScore}%</div></div>`).join('') : '<p class="small">No units in queue yet. Import a source and keep units enabled in queue from Source Portal.</p>'}</aside>
   <section class="col"><div class="panel" style="padding:12px"><h3>${u?.title || 'No unit selected'}</h3><div class="small">${u ? `${u.sourceTitle} • ${u.pageStart ? `pp.${u.pageStart}-${u.pageEnd}` : `${u.timeStartSec || 0}-${u.timeEndSec || 0}s`}` : 'Select a unit to begin.'}</div><div class="row"><button class="btn" id="open-history" ${u ? '' : 'disabled'}>Review History</button><div class="small">Retention<div>${u?.retentionScore || 0}%</div></div></div></div>
   <div class="panel" style="padding:12px"><div class="controls"><strong id="timer">${format(v.elapsedSec)}</strong><button class="btn" id="start-stop" ${u ? '' : 'disabled'}>${v.timerRunning ? 'Pause' : 'Start'}</button><button class="btn" id="restart" ${u ? '' : 'disabled'}>Restart</button><button class="btn outcome" data-outcome="easy" ${u ? '' : 'disabled'}>Easy</button><button class="btn outcome" data-outcome="with_effort" ${u ? '' : 'disabled'}>With Effort</button><button class="btn outcome" data-outcome="hard" ${u ? '' : 'disabled'}>Hard</button><button class="btn outcome" data-outcome="skip" ${u ? '' : 'disabled'}>Skip</button><button class="btn" id="queue-jump" ${queueLocator ? '' : 'disabled'}>Jump to unit</button></div><div class="small">${queueLocator ? 'Location available' : 'location unavailable'}</div><div class="row"><textarea id="pre-note" rows="3" placeholder="Pre-recall note" style="flex:1">${v.preRecallNote || ''}</textarea><textarea id="post-note" rows="3" placeholder="Post-recall note" style="flex:1">${v.postRecallNote || ''}</textarea></div></div>
-  <div class="panel viewer" style="min-height:220px"><div class="small">${u?.title || 'No unit loaded'}</div><div id="queue-viewer-content" class="viewer-doc"></div></div></section></div>`;
+  <div class="panel viewer" style="min-height:220px"><div class="small">${u?.title || 'No unit loaded'}</div><div id="queue-viewer-slot"></div></div></section></div>`;
 
-  const viewerEl = document.getElementById('queue-viewer-content');
+  const viewerEl = restorePersistentViewerHost('queue', 'queue-viewer-slot');
   renderSourceViewer(queueSource, u, viewerEl, {
+    viewerKey: 'queue',
     zoomPercent: state.view.portal.viewerZoom || 120,
     defaultPage: state.view.portal.viewerPage || 1
   });
-  const controller = createViewerController(queueSource, viewerEl);
+  const controller = createViewerController(queueSource, viewerEl, { viewerKey: 'queue' });
 
   document.querySelectorAll('[data-unit]').forEach(el => el.onclick = () => {
     const selectedUnit = units.find(item => item.id === el.dataset.unit) || null;
@@ -1900,7 +2024,6 @@ function renderQueue() {
     if (queueLocator.kind === 'page') controller.goToPage(queueLocator.page);
     if (queueLocator.kind === 'time') controller.seekTo(queueLocator.seconds);
     if (queueSource?.id) rememberViewerPosition(queueSource.id, controller.getPosition() || queueLocator);
-    renderQueue();
     save();
   };
   document.getElementById('pre-note').oninput = e => { v.preRecallNote = e.target.value; save(); };
