@@ -632,7 +632,21 @@ async function renderPdfViewer(source, selectedUnitOrOutlineItem, containerEl, o
 
     if (containerEl.dataset.pdfSourceCacheKey === pdfCacheKey && existingFrame && existingLocation) {
       existingLocation.textContent = `PDF page ${pageNumber} of ${totalPages}`;
-      if (existingFrame.getAttribute('src') !== viewerUrl) {
+      const viewerHash = `#page=${pageNumber}&zoom=${zoomPercent}`;
+      let hashApplied = false;
+      try {
+        if (existingFrame.contentWindow && existingFrame.contentWindow.location) {
+          const currentHash = existingFrame.contentWindow.location.hash || '';
+          if (currentHash !== viewerHash) {
+            existingFrame.contentWindow.location.replace(viewerHash);
+          }
+          hashApplied = true;
+        }
+      } catch {
+        hashApplied = false;
+      }
+
+      if (!hashApplied && existingFrame.getAttribute('src') !== viewerUrl) {
         existingFrame.setAttribute('src', viewerUrl);
       }
       return;
