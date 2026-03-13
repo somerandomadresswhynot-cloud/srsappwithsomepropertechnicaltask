@@ -145,7 +145,17 @@ function inferSourceMetadata(source, units = []) {
 
 
 const viewerPdfCache = new Map();
+const viewerPdfPageCountCache = new Map();
+const viewerPdfBytesCache = new Map();
+const viewerPdfPageCache = new Map();
+const viewerPdfRenderCache = new Map();
 const viewerAssetUrlCache = new Map();
+
+const PDF_BYTES_BUDGET = 150 * 1024 * 1024;
+const PDF_RENDER_BUDGET = 64 * 1024 * 1024;
+const PDF_RENDER_MAX_ENTRIES = 12;
+const PDF_ACTIVE_DOC_LIMIT = 2;
+const PDF_PAGE_WINDOW_RADIUS = 2;
 
 const ASSET_DB_NAME = 'srs-app-assets';
 const ASSET_DB_VERSION = 1;
@@ -211,6 +221,21 @@ async function deleteAssetBlob(assetId) {
     URL.revokeObjectURL(cachedUrl);
     viewerAssetUrlCache.delete(assetId);
   }
+
+  const pdfCacheKey = `asset:${assetId}`;
+  const cachedPdf = viewerPdfCache.get(pdfCacheKey);
+  if (cachedPdf?.destroy) {
+    try { cachedPdf.destroy(); } catch {}
+  }
+  viewerPdfCache.delete(pdfCacheKey);
+  viewerPdfPageCountCache.delete(pdfCacheKey);
+  viewerPdfBytesCache.delete(pdfCacheKey);
+  for (const pageKey of [...viewerPdfPageCache.keys()]) {
+    if (pageKey.startsWith(`${pdfCacheKey}:`)) viewerPdfPageCache.delete(pageKey);
+  }
+  for (const renderKey of [...viewerPdfRenderCache.keys()]) {
+    if (renderKey.startsWith(`${pdfCacheKey}:`)) viewerPdfRenderCache.delete(renderKey);
+  }
 }
 
 async function getAssetObjectUrl(assetId) {
@@ -225,6 +250,65 @@ async function getAssetObjectUrl(assetId) {
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function getPdfSourceCacheKey(source) {
+  return source?.assetId ? `asset:${source.assetId}` : `origin:${source?.origin || ''}`;
+}
+
+function evictPdfBytesCacheIfNeeded() {
+  let total = [...viewerPdfBytesCache.values()].reduce((sum, entry) => sum + (entry.sizeBytes || 0), 0);
+  if (total <= PDF_BYTES_BUDGET) return;
+  const entries = [...viewerPdfBytesCache.entries()].sort((a, b) => (a[1].lastUsedAt || 0) - (b[1].lastUsedAt || 0));
+  for (const [key, entry] of entries) {
+    viewerPdfBytesCache.delete(key);
+    total -= entry.sizeBytes || 0;
+    if (total <= PDF_BYTES_BUDGET) break;
+  }
+}
+
+function evictPdfDocumentsIfNeeded(activeKey) {
+  const entries = [...viewerPdfCache.entries()];
+  if (entries.length <= PDF_ACTIVE_DOC_LIMIT) return;
+  const candidates = entries
+    .filter(([key]) => key !== activeKey)
+    .sort((a, b) => ((a[1]?.__lastUsedAt || 0) - (b[1]?.__lastUsedAt || 0)));
+
+  for (const [key, doc] of candidates) {
+    if (viewerPdfCache.size <= PDF_ACTIVE_DOC_LIMIT) break;
+    viewerPdfCache.delete(key);
+    if (doc?.destroy) {
+      try { doc.destroy(); } catch {}
+    }
+    for (const pageKey of [...viewerPdfPageCache.keys()]) {
+      if (pageKey.startsWith(`${key}:`)) viewerPdfPageCache.delete(pageKey);
+    }
+    for (const renderKey of [...viewerPdfRenderCache.keys()]) {
+      if (renderKey.startsWith(`${key}:`)) viewerPdfRenderCache.delete(renderKey);
+    }
+  }
+}
+
+function evictPdfRenderCacheIfNeeded() {
+  let total = [...viewerPdfRenderCache.values()].reduce((sum, entry) => sum + (entry.bytesEstimate || 0), 0);
+  if (total <= PDF_RENDER_BUDGET && viewerPdfRenderCache.size <= PDF_RENDER_MAX_ENTRIES) return;
+  const entries = [...viewerPdfRenderCache.entries()].sort((a, b) => (a[1].lastUsedAt || 0) - (b[1].lastUsedAt || 0));
+  for (const [key, entry] of entries) {
+    viewerPdfRenderCache.delete(key);
+    total -= entry.bytesEstimate || 0;
+    if (total <= PDF_RENDER_BUDGET && viewerPdfRenderCache.size <= PDF_RENDER_MAX_ENTRIES) break;
+  }
+}
+
+function trimPdfPageCache(sourceKey, currentPage) {
+  for (const pageKey of [...viewerPdfPageCache.keys()]) {
+    if (!pageKey.startsWith(`${sourceKey}:`)) continue;
+    const page = Number(pageKey.split(':').pop());
+    if (!Number.isFinite(page)) continue;
+    if (Math.abs(page - currentPage) > PDF_PAGE_WINDOW_RADIUS) {
+      viewerPdfPageCache.delete(pageKey);
+    }
+  }
 }
 
 function escapeHtml(value) {
@@ -566,17 +650,49 @@ function renderUnsupportedViewer(source, containerEl, reason) {
   containerEl.innerHTML = `<div class="viewer-fallback"><h4>Viewer unavailable</h4><p>${escapeHtml(reason || `No renderer available for source type "${source?.sourceType || 'unknown'}".`)}</p></div>`;
 }
 
-async function loadPdfDocument(source) {
-  if (!window.pdfjsLib) throw new Error('pdf.js is not loaded in this session.');
-  const cacheKey = source?.assetId ? `asset:${source.assetId}` : `origin:${source?.origin || ''}`;
-  if (viewerPdfCache.has(cacheKey)) return viewerPdfCache.get(cacheKey);
+async function getPdfBytesForSource(source) {
+  const sourceKey = getPdfSourceCacheKey(source);
+  const cached = viewerPdfBytesCache.get(sourceKey);
+  if (cached?.bytes) {
+    cached.lastUsedAt = Date.now();
+    return cached.bytes;
+  }
 
-  let task;
+  let bytes;
   if (source?.assetId) {
     const blob = await getAssetBlob(source.assetId);
     if (!blob) throw new Error('Stored PDF file is missing. Re-upload this source from Sources page.');
-    const data = await blob.arrayBuffer();
-    task = window.pdfjsLib.getDocument({ data });
+    bytes = new Uint8Array(await blob.arrayBuffer());
+  } else if (source?.origin) {
+    try {
+      const response = await fetch(source.origin);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      bytes = new Uint8Array(await response.arrayBuffer());
+    } catch {
+      return null;
+    }
+  } else {
+    throw new Error('PDF source file is missing.');
+  }
+
+  viewerPdfBytesCache.set(sourceKey, { bytes, sizeBytes: bytes.byteLength, lastUsedAt: Date.now() });
+  evictPdfBytesCacheIfNeeded();
+  return bytes;
+}
+
+async function loadPdfDocument(source) {
+  if (!window.pdfjsLib) throw new Error('pdf.js is not loaded in this session.');
+  const cacheKey = getPdfSourceCacheKey(source);
+  if (viewerPdfCache.has(cacheKey)) {
+    const cached = viewerPdfCache.get(cacheKey);
+    cached.__lastUsedAt = Date.now();
+    return cached;
+  }
+
+  const bytes = await getPdfBytesForSource(source);
+  let task;
+  if (bytes) {
+    task = window.pdfjsLib.getDocument({ data: bytes });
   } else if (source?.origin) {
     task = window.pdfjsLib.getDocument(source.origin);
   } else {
@@ -584,53 +700,117 @@ async function loadPdfDocument(source) {
   }
 
   const pdf = await task.promise;
+  pdf.__lastUsedAt = Date.now();
   viewerPdfCache.set(cacheKey, pdf);
+  evictPdfDocumentsIfNeeded(cacheKey);
   return pdf;
+}
+
+async function loadPdfPage(pdf, sourceKey, pageNumber) {
+  const pageKey = `${sourceKey}:${pageNumber}`;
+  if (viewerPdfPageCache.has(pageKey)) return viewerPdfPageCache.get(pageKey);
+  const page = await pdf.getPage(pageNumber);
+  viewerPdfPageCache.set(pageKey, page);
+  trimPdfPageCache(sourceKey, pageNumber);
+  return page;
+}
+
+async function renderPdfPageToCanvas({ pdf, sourceKey, pageNumber, scale, targetCanvas }) {
+  const renderScale = Number(scale.toFixed(2));
+  const renderKey = `${sourceKey}:${pageNumber}:${renderScale}`;
+  const cached = viewerPdfRenderCache.get(renderKey);
+
+  const ctx = targetCanvas.getContext('2d', { alpha: false });
+  if (cached?.canvas) {
+    cached.lastUsedAt = Date.now();
+    targetCanvas.width = cached.width;
+    targetCanvas.height = cached.height;
+    targetCanvas.style.width = `${cached.width}px`;
+    targetCanvas.style.height = `${cached.height}px`;
+    ctx.drawImage(cached.canvas, 0, 0);
+    return { width: cached.width, height: cached.height, fromCache: true };
+  }
+
+  const page = await loadPdfPage(pdf, sourceKey, pageNumber);
+  const viewport = page.getViewport({ scale: renderScale });
+  const width = Math.ceil(viewport.width);
+  const height = Math.ceil(viewport.height);
+
+  targetCanvas.width = width;
+  targetCanvas.height = height;
+  targetCanvas.style.width = `${width}px`;
+  targetCanvas.style.height = `${height}px`;
+
+  await page.render({ canvasContext: ctx, viewport }).promise;
+
+  const cacheCanvas = document.createElement('canvas');
+  cacheCanvas.width = width;
+  cacheCanvas.height = height;
+  const cacheCtx = cacheCanvas.getContext('2d', { alpha: false });
+  cacheCtx.drawImage(targetCanvas, 0, 0);
+
+  viewerPdfRenderCache.set(renderKey, {
+    canvas: cacheCanvas,
+    width,
+    height,
+    bytesEstimate: width * height * 4,
+    lastUsedAt: Date.now()
+  });
+  evictPdfRenderCacheIfNeeded();
+  return { width, height, fromCache: false };
 }
 
 async function renderPdfViewer(source, selectedUnitOrOutlineItem, containerEl, options = {}) {
   const renderToken = `${Date.now()}-${Math.random()}`;
   containerEl.dataset.renderToken = renderToken;
-  containerEl.innerHTML = '<div class="small">Loading PDF preview…</div>';
 
   try {
+    const pdfCacheKey = getPdfSourceCacheKey(source);
+    let pageWrap = containerEl.querySelector('.pdf-page-wrap');
+    let canvas = containerEl.querySelector('canvas.pdf-canvas');
+    let locationEl = containerEl.querySelector('.viewer-location');
+
+    if (!pageWrap || !canvas || !locationEl || containerEl.dataset.pdfSourceCacheKey !== pdfCacheKey) {
+      containerEl.innerHTML = '<div class="small">Loading PDF preview…</div>';
+    }
+
+    let totalPages = viewerPdfPageCountCache.get(pdfCacheKey);
     const pdf = await loadPdfDocument(source);
+    if (!Number.isFinite(totalPages)) {
+      totalPages = pdf.numPages;
+      viewerPdfPageCountCache.set(pdfCacheKey, totalPages);
+    }
+
     const requestedPage = Number.isFinite(selectedUnitOrOutlineItem?.pageStart)
       ? selectedUnitOrOutlineItem.pageStart
       : Number.isFinite(options.defaultPage)
         ? options.defaultPage
         : 1;
-    const pageNumber = clamp(Math.floor(requestedPage), 1, pdf.numPages);
-    const scale = clamp((options.zoomPercent || 120) / 100, 0.5, 2.5);
-    const page = await pdf.getPage(pageNumber);
-    const viewport = page.getViewport({ scale });
+
+    const pageNumber = clamp(Math.floor(requestedPage), 1, totalPages);
+    const scale = clamp((options.zoomPercent || 120) / 100, 0.5, 2.4);
 
     if (containerEl.dataset.renderToken !== renderToken) return;
-    containerEl.innerHTML = `<div class="viewer-location">PDF page ${pageNumber} of ${pdf.numPages}</div>`;
 
-    const pageWrap = document.createElement('div');
-    pageWrap.className = 'pdf-page-wrap';
-    pageWrap.style.width = `${Math.ceil(viewport.width)}px`;
+    if (!pageWrap || !canvas || !locationEl || containerEl.dataset.pdfSourceCacheKey !== pdfCacheKey) {
+      containerEl.dataset.pdfSourceCacheKey = pdfCacheKey;
+      containerEl.innerHTML = `<div class="viewer-location">PDF page ${pageNumber} of ${totalPages}</div><div class="pdf-page-wrap"><canvas class="pdf-canvas"></canvas></div>`;
+      locationEl = containerEl.querySelector('.viewer-location');
+      pageWrap = containerEl.querySelector('.pdf-page-wrap');
+      canvas = containerEl.querySelector('canvas.pdf-canvas');
+    } else {
+      locationEl.textContent = `PDF page ${pageNumber} of ${totalPages}`;
+    }
 
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.ceil(viewport.width);
-    canvas.height = Math.ceil(viewport.height);
-    canvas.className = 'pdf-canvas';
+    await renderPdfPageToCanvas({
+      pdf,
+      sourceKey: pdfCacheKey,
+      pageNumber,
+      scale,
+      targetCanvas: canvas
+    });
 
-    const textLayer = document.createElement('div');
-    textLayer.className = 'pdf-text-layer';
-    textLayer.style.width = `${Math.ceil(viewport.width)}px`;
-    textLayer.style.height = `${Math.ceil(viewport.height)}px`;
-
-    pageWrap.append(canvas, textLayer);
-    containerEl.append(pageWrap);
-
-    const context = canvas.getContext('2d', { alpha: false });
-    await page.render({ canvasContext: context, viewport }).promise;
-
-    const text = await page.getTextContent();
-    const textLayerTask = window.pdfjsLib.renderTextLayer({ textContent: text, container: textLayer, viewport });
-    if (textLayerTask?.promise) await textLayerTask.promise;
+    pageWrap.style.width = `${canvas.width}px`;
   } catch (error) {
     renderUnsupportedViewer(source, containerEl, `Unable to render PDF preview: ${error.message}`);
   }
@@ -1543,7 +1723,7 @@ function renderPortal() {
   if (!v.selectedHierarchyItemId && selected) v.selectedHierarchyItemId = selected.id;
 
   pageRoot.innerHTML = `<div class="portal"><aside class="panel"><div style="padding:10px"><h3>${source.title}</h3><input id="outline-search" placeholder="Search outline" value="${v.outlineSearchText}"></div><div class="outline-tools"><span class="small">Queue all</span><button class="queue-master ${allInQueue ? 'queue-on' : 'queue-off'}" id="toggle-all-queue" title="${allInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue'}" aria-label="${allInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue'}"></button></div><div class="outline-list">${filtered.map(item => `<div class="outline-item ${item.id === selected?.id ? 'selected' : ''}" data-item="${item.id}"><div><div class="indent" style="--depth:${item.depth}">${item.isLeaf ? '📄' : '📁'} ${item.title}</div>${formatRangeLabel(item) ? `<div class="small" style="padding-left:${Math.min(item.depth + 1, 6) * 16}px">${formatRangeLabel(item)}</div>` : ''}</div>${renderQueueBars(item)}</div>`).join('') || '<p class="small" style="padding:8px">No outline items.</p>'}</div></aside>
-  <section class="panel viewer"><div class="row" style="justify-content:space-between"><h3>Viewer</h3><div class="controls"><button class="btn" id="zoom-out">-</button><span>${v.viewerZoom || 120}%</span><button class="btn" id="zoom-in">+</button><button class="btn" id="portal-jump" ${selectedLocator ? '' : 'disabled'}>Jump to selected</button></div></div><div class="small">${selected?.title || 'No item selected'}</div><div class="small">${selectedLocator ? 'Location available' : 'location unavailable'}</div><div id="portal-viewer-content" class="viewer-doc"></div></section>
+  <section class="panel viewer"><div class="row" style="justify-content:space-between"><h3>Viewer</h3><div class="controls"><button class="btn" id="zoom-out">-</button><span id="portal-zoom-label">${v.viewerZoom || 120}%</span><button class="btn" id="zoom-in">+</button><button class="btn" id="portal-jump" ${selectedLocator ? '' : 'disabled'}>Jump to selected</button></div></div><div class="small" id="portal-selected-title">${selected?.title || 'No item selected'}</div><div class="small" id="portal-selected-location">${selectedLocator ? 'Location available' : 'location unavailable'}</div><div id="portal-viewer-content" class="viewer-doc"></div></section>
   <aside class="panel" style="padding:12px"><h3>Unit Meta</h3><div class="small">Source Type: ${source.sourceType}</div><div class="small">Priority: ${source.priority}</div><div class="small">Units: ${source.totalUnits}</div><div class="small">Queue On/Off via bars in outline.</div></aside></div>`;
 
   const viewerEl = document.getElementById('portal-viewer-content');
@@ -1567,17 +1747,41 @@ function renderPortal() {
     syncSelectionAcrossPortalAndQueue(source, item, unit);
     if (locator?.kind === 'page') controller.goToPage(locator.page);
     if (locator?.kind === 'time') controller.seekTo(locator.seconds);
-    rememberViewerPosition(source.id, controller.getPosition() || locator);
-    renderPortal();
+
+    const selectedTitleEl = document.getElementById('portal-selected-title');
+    const selectedLocationEl = document.getElementById('portal-selected-location');
+    const jumpEl = document.getElementById('portal-jump');
+    if (selectedTitleEl) selectedTitleEl.textContent = item?.title || 'No item selected';
+    if (selectedLocationEl) selectedLocationEl.textContent = locator ? 'Location available' : 'location unavailable';
+    if (jumpEl) jumpEl.disabled = !locator;
+
+    document.querySelectorAll('.outline-item[data-item]').forEach(node => {
+      node.classList.toggle('selected', node.getAttribute('data-item') === item?.id);
+    });
+
+    renderSourceViewer(source, unit || item, viewerEl, {
+      zoomPercent: v.viewerZoom || 120,
+      defaultPage: v.viewerPage || 1
+    });
+
+    rememberViewerPosition(source.id, locator || controller.getPosition());
     save();
   });
 
   document.getElementById('portal-jump').onclick = () => {
-    if (!selectedLocator) return;
-    if (selectedLocator.kind === 'page') controller.goToPage(selectedLocator.page);
-    if (selectedLocator.kind === 'time') controller.seekTo(selectedLocator.seconds);
-    rememberViewerPosition(source.id, controller.getPosition() || selectedLocator);
-    renderPortal();
+    const activeItem = outline.find(x => x.id === v.selectedHierarchyItemId) || null;
+    const activeUnit = activeItem ? state.data.units.find(u => u.sourceId === source.id && u.hierarchyId === activeItem.id) || null : null;
+    const activeLocator = activeItem ? (getLocatorForHierarchyItem(source, activeItem) || getLocatorForUnit(activeUnit)) : null;
+    if (!activeLocator) return;
+    if (activeLocator.kind === 'page') controller.goToPage(activeLocator.page);
+    if (activeLocator.kind === 'time') controller.seekTo(activeLocator.seconds);
+
+    renderSourceViewer(source, activeUnit || activeItem, viewerEl, {
+      zoomPercent: v.viewerZoom || 120,
+      defaultPage: v.viewerPage || 1
+    });
+
+    rememberViewerPosition(source.id, activeLocator || controller.getPosition());
     save();
   };
 
@@ -1596,8 +1800,30 @@ function renderPortal() {
   };
 
   document.querySelectorAll('[data-toggle]').forEach(el => el.onclick = onToggleQueue);
-  document.getElementById('zoom-in').onclick = () => { v.viewerZoom = Math.min(200, (v.viewerZoom || 120) + 10); renderPortal(); save(); };
-  document.getElementById('zoom-out').onclick = () => { v.viewerZoom = Math.max(50, (v.viewerZoom || 120) - 10); renderPortal(); save(); };
+  document.getElementById('zoom-in').onclick = () => {
+    v.viewerZoom = Math.min(200, (v.viewerZoom || 120) + 10);
+    const selectedItem = outline.find(x => x.id === v.selectedHierarchyItemId) || selected;
+    const selectedItemUnit = selectedItem ? state.data.units.find(u => u.sourceId === source.id && u.hierarchyId === selectedItem.id) || null : null;
+    const zoomLabel = document.getElementById('portal-zoom-label');
+    if (zoomLabel) zoomLabel.textContent = `${v.viewerZoom}%`;
+    renderSourceViewer(source, selectedItemUnit || selectedItem, viewerEl, {
+      zoomPercent: v.viewerZoom || 120,
+      defaultPage: v.viewerPage || 1
+    });
+    save();
+  };
+  document.getElementById('zoom-out').onclick = () => {
+    v.viewerZoom = Math.max(50, (v.viewerZoom || 120) - 10);
+    const selectedItem = outline.find(x => x.id === v.selectedHierarchyItemId) || selected;
+    const selectedItemUnit = selectedItem ? state.data.units.find(u => u.sourceId === source.id && u.hierarchyId === selectedItem.id) || null : null;
+    const zoomLabel = document.getElementById('portal-zoom-label');
+    if (zoomLabel) zoomLabel.textContent = `${v.viewerZoom}%`;
+    renderSourceViewer(source, selectedItemUnit || selectedItem, viewerEl, {
+      zoomPercent: v.viewerZoom || 120,
+      defaultPage: v.viewerPage || 1
+    });
+    save();
+  };
   rememberViewerPosition(source.id, controller.getPosition() || selectedLocator);
 }
 
