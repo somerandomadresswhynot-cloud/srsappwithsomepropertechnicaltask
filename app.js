@@ -205,13 +205,14 @@ function normalizeSourceOrigin(sourceType, rawOrigin) {
 
   const isHttp = parsedUrl && ['http:', 'https:'].includes(parsedUrl.protocol);
   const isFileUrl = parsedUrl && parsedUrl.protocol === 'file:';
+  const isBlobUrl = parsedUrl && parsedUrl.protocol === 'blob:';
   const looksLikeLocalPath = /^(\/|~\/|\.\.?\/|[A-Za-z]:[\\/]|\\\\)/.test(origin) || (!parsedUrl && /[\\/]/.test(origin));
 
   if (localTypes.has(sourceType)) {
-    if (!isFileUrl && !looksLikeLocalPath) {
-      return { ok: false, error: 'This source type requires a local file URL/path (e.g., /files/book.pdf or file:///videos/lecture.mp4).' };
+    if (!isFileUrl && !isBlobUrl && !looksLikeLocalPath) {
+      return { ok: false, error: 'This source type requires a local path/URL (e.g., /files/book.pdf, file:///videos/lecture.mp4, or an uploaded file).' };
     }
-    const normalized = isFileUrl ? parsedUrl.toString() : origin.replaceAll('\\\\', '/');
+    const normalized = (isFileUrl || isBlobUrl) ? parsedUrl.toString() : origin.replaceAll('\\', '/');
     return { ok: true, origin: normalized, originRef: normalized };
   }
 
@@ -611,6 +612,7 @@ ensureQueueConsistency();
 normalizeQueueSelection();
 const importDraft = {
   file: null,
+  objectUrl: null,
   parsedSections: [],
   parsedPdfTotalPages: null,
   detectedVideoDurationSec: null,
@@ -1096,7 +1098,13 @@ function reconcileQueueFlagsFromHierarchy() {
 }
 
 async function processImportedFile(file) {
+  if (importDraft.objectUrl) {
+    URL.revokeObjectURL(importDraft.objectUrl);
+    importDraft.objectUrl = null;
+  }
+
   importDraft.file = file;
+  importDraft.objectUrl = URL.createObjectURL(file);
   importDraft.parsedSections = [];
   importDraft.parsedPdfTotalPages = null;
   importDraft.detectedVideoDurationSec = null;
@@ -1105,7 +1113,7 @@ async function processImportedFile(file) {
   const status = document.getElementById('import-parse-status');
 
   document.getElementById('import-title').value = file.name;
-  document.getElementById('import-origin').value = file.name;
+  document.getElementById('import-origin').value = importDraft.objectUrl;
   document.getElementById('import-size').value = isPdf ? `${Math.max(1, Math.round(file.size / 1024 / 1024))} MB PDF` : `${Math.max(1, Math.round(file.size / 1024))} KB file`;
   if (isPdf) document.getElementById('import-type').value = 'pdf';
   if (isVideo) document.getElementById('import-type').value = 'local_video';
@@ -1195,6 +1203,7 @@ function updateImportTypeHints() {
 
 function openImportModal() {
   importDraft.file = null;
+  importDraft.objectUrl = null;
   importDraft.parsedSections = [];
   importDraft.parsedPdfTotalPages = null;
   importDraft.detectedVideoDurationSec = null;
@@ -1261,6 +1270,7 @@ function openImportModal() {
 
 function closeImportModal() {
   importDraft.file = null;
+  importDraft.objectUrl = null;
   importDraft.parsedSections = [];
   importDraft.parsedPdfTotalPages = null;
   importDraft.detectedVideoDurationSec = null;
