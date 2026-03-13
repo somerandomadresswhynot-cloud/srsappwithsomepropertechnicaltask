@@ -44,6 +44,6 @@
 4. Add lightweight telemetry logs to diagnose storage failures.
 
 ## Immediate bug backlog items
-1. Replace transient uploaded-file `blob:` origins with IndexedDB-backed assets.
-2. Add clear stale-asset message for persisted sources that cannot be resolved.
-3. Add a one-click "relink source file" action on viewer errors.
+1. Add a one-click "relink source file" action on viewer errors when a stored asset is missing.
+2. Add a visible import progress indicator while writing large assets to IndexedDB.
+3. Add background cleanup for orphaned assets not referenced by any source.
