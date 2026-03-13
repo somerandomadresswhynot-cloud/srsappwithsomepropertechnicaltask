@@ -145,6 +145,7 @@ function inferSourceMetadata(source, units = []) {
 
 
 const viewerPdfCache = new Map();
+const viewerPdfPageCountCache = new Map();
 const viewerAssetUrlCache = new Map();
 
 const ASSET_DB_NAME = 'srs-app-assets';
@@ -211,6 +212,10 @@ async function deleteAssetBlob(assetId) {
     URL.revokeObjectURL(cachedUrl);
     viewerAssetUrlCache.delete(assetId);
   }
+
+  const pdfCacheKey = `asset:${assetId}`;
+  viewerPdfCache.delete(pdfCacheKey);
+  viewerPdfPageCountCache.delete(pdfCacheKey);
 }
 
 async function getAssetObjectUrl(assetId) {
@@ -225,6 +230,10 @@ async function getAssetObjectUrl(assetId) {
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function getPdfSourceCacheKey(source) {
+  return source?.assetId ? `asset:${source.assetId}` : `origin:${source?.origin || ''}`;
 }
 
 function escapeHtml(value) {
@@ -591,14 +600,23 @@ async function loadPdfDocument(source) {
 async function renderPdfViewer(source, selectedUnitOrOutlineItem, containerEl, options = {}) {
   const renderToken = `${Date.now()}-${Math.random()}`;
   containerEl.dataset.renderToken = renderToken;
-  containerEl.innerHTML = '<div class="small">Loading PDF preview…</div>';
 
   try {
-    const pdf = await loadPdfDocument(source);
+    const pdfCacheKey = getPdfSourceCacheKey(source);
+    const existingFrame = containerEl.querySelector('iframe.pdf-frame');
+    const existingLocation = containerEl.querySelector('.viewer-location');
     const pdfUrl = source?.assetId ? await getAssetObjectUrl(source.assetId) : source?.origin;
     if (!pdfUrl) {
       renderUnsupportedViewer(source, containerEl, 'PDF source file is missing.');
       return;
+    }
+
+    let totalPages = viewerPdfPageCountCache.get(pdfCacheKey);
+    if (!Number.isFinite(totalPages)) {
+      if (!existingFrame) containerEl.innerHTML = '<div class="small">Loading PDF preview…</div>';
+      const pdf = await loadPdfDocument(source);
+      totalPages = pdf.numPages;
+      viewerPdfPageCountCache.set(pdfCacheKey, totalPages);
     }
 
     const requestedPage = Number.isFinite(selectedUnitOrOutlineItem?.pageStart)
@@ -606,12 +624,22 @@ async function renderPdfViewer(source, selectedUnitOrOutlineItem, containerEl, o
       : Number.isFinite(options.defaultPage)
         ? options.defaultPage
         : 1;
-    const pageNumber = clamp(Math.floor(requestedPage), 1, pdf.numPages);
+    const pageNumber = clamp(Math.floor(requestedPage), 1, totalPages);
     const zoomPercent = Math.round(clamp(options.zoomPercent || 120, 50, 250));
     const viewerUrl = `${pdfUrl}#page=${pageNumber}&zoom=${zoomPercent}`;
 
     if (containerEl.dataset.renderToken !== renderToken) return;
-    containerEl.innerHTML = `<div class="viewer-location">PDF page ${pageNumber} of ${pdf.numPages}</div><iframe class="pdf-frame" src="${escapeHtml(viewerUrl)}" title="PDF viewer" loading="lazy"></iframe>`;
+
+    if (containerEl.dataset.pdfSourceCacheKey === pdfCacheKey && existingFrame && existingLocation) {
+      existingLocation.textContent = `PDF page ${pageNumber} of ${totalPages}`;
+      if (existingFrame.getAttribute('src') !== viewerUrl) {
+        existingFrame.setAttribute('src', viewerUrl);
+      }
+      return;
+    }
+
+    containerEl.dataset.pdfSourceCacheKey = pdfCacheKey;
+    containerEl.innerHTML = `<div class="viewer-location">PDF page ${pageNumber} of ${totalPages}</div><iframe class="pdf-frame" src="${escapeHtml(viewerUrl)}" title="PDF viewer" loading="lazy"></iframe>`;
   } catch (error) {
     renderUnsupportedViewer(source, containerEl, `Unable to render PDF preview: ${error.message}`);
   }
