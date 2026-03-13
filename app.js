@@ -638,55 +638,97 @@ function createViewerController(source, containerEl, options = {}) {
   };
 }
 
-function buildPdfViewerUrl(fileUrl, page, zoomPercent) {
-  const params = new URLSearchParams();
-  params.set('page', String(Math.max(1, Math.floor(page || 1))));
-  params.set('zoom', String(Math.max(50, Math.floor(zoomPercent || 120))));
-  return `${fileUrl}#${params.toString()}`;
-}
-
 function getOrCreatePdfViewerController(viewerKey) {
   if (viewerInstanceCache.has(viewerKey)) return viewerInstanceCache.get(viewerKey);
 
   const shell = document.createElement('div');
-  shell.className = 'pdf-native-viewer-shell';
-  shell.innerHTML = `<div class="viewer-location"></div><iframe class="pdf-native-frame" title="PDF viewer" loading="lazy"></iframe>`;
+  shell.className = 'pdfjs-viewer-shell';
+  shell.innerHTML = `
+    <div class="viewer-location"></div>
+    <div class="pdfjs-host">
+      <div class="pdfjs-viewer-container">
+        <div class="pdfViewer"></div>
+      </div>
+    </div>
+  `;
   const locationEl = shell.querySelector('.viewer-location');
-  const frameEl = shell.querySelector('iframe.pdf-native-frame');
+  const viewerContainerEl = shell.querySelector('.pdfjs-viewer-container');
+  const viewerEl = shell.querySelector('.pdfViewer');
 
   const controller = {
     viewerKey,
     shell,
     locationEl,
-    frameEl,
+    viewerContainerEl,
+    viewerEl,
     mountedContainer: null,
     sourceKey: null,
-    fileUrl: null,
+    pdfDocument: null,
     totalPages: null,
     currentPage: 1,
     zoomPercent: 120,
+    pdfViewer: null,
+    linkService: null,
+    eventBus: null,
+    initialized: false,
+    initializing: null,
+    ensureInitialized() {
+      if (this.initialized) return Promise.resolve();
+      if (this.initializing) return this.initializing;
+      this.initializing = (async () => {
+        if (!window.pdfjsViewer) throw new Error('pdf.js viewer components are not loaded in this session.');
+
+        this.eventBus = new window.pdfjsViewer.EventBus();
+        this.linkService = new window.pdfjsViewer.PDFLinkService({ eventBus: this.eventBus });
+        this.pdfViewer = new window.pdfjsViewer.PDFViewer({
+          container: this.viewerContainerEl,
+          viewer: this.viewerEl,
+          eventBus: this.eventBus,
+          linkService: this.linkService,
+          textLayerMode: 1,
+          annotationMode: 2
+        });
+        this.linkService.setViewer(this.pdfViewer);
+        this.eventBus.on('pagechanging', evt => {
+          if (Number.isFinite(evt?.pageNumber)) {
+            this.currentPage = Math.max(1, Math.floor(evt.pageNumber));
+            if (state?.view?.portal) state.view.portal.viewerPage = this.currentPage;
+            this.locationEl.textContent = `PDF page ${this.currentPage} of ${this.totalPages || '?'}`;
+          }
+        });
+
+        this.initialized = true;
+      })().finally(() => {
+        this.initializing = null;
+      });
+      return this.initializing;
+    },
     mount(containerEl) {
       if (!containerEl || this.mountedContainer === containerEl) return;
       containerEl.innerHTML = '';
       containerEl.appendChild(this.shell);
       this.mountedContainer = containerEl;
     },
-    open({ sourceKey, fileUrl, page, zoomPercent, totalPages }) {
+    async open({ sourceKey, pdfDocument, page, zoomPercent, totalPages }) {
+      await this.ensureInitialized();
       const safePage = Math.max(1, Math.floor(page || 1));
       const safeZoom = Math.max(50, Math.floor(zoomPercent || 120));
-      const sourceChanged = this.sourceKey !== sourceKey || this.fileUrl !== fileUrl;
+      const sourceChanged = this.sourceKey !== sourceKey || this.pdfDocument !== pdfDocument;
       const pageChanged = this.currentPage !== safePage;
       const zoomChanged = this.zoomPercent !== safeZoom;
 
       this.sourceKey = sourceKey;
-      this.fileUrl = fileUrl;
+      this.pdfDocument = pdfDocument;
       this.totalPages = totalPages;
       this.currentPage = safePage;
       this.zoomPercent = safeZoom;
       this.locationEl.textContent = `PDF page ${safePage} of ${totalPages}`;
 
       if (sourceChanged) {
-        this.frameEl.src = buildPdfViewerUrl(fileUrl, safePage, safeZoom);
+        this.pdfViewer.setDocument(pdfDocument);
+        this.linkService.setDocument(pdfDocument, null);
+        this.pdfViewer.currentScaleValue = String(safeZoom / 100);
+        this.pdfViewer.currentPageNumber = safePage;
         return;
       }
 
@@ -699,12 +741,9 @@ function getOrCreatePdfViewerController(viewerKey) {
       this.currentPage = safePage;
       this.zoomPercent = safeZoom;
       this.locationEl.textContent = `PDF page ${safePage} of ${this.totalPages || '?'}`;
-      if (!this.frameEl.contentWindow) return;
-      try {
-        this.frameEl.contentWindow.location.replace(`#page=${safePage}&zoom=${safeZoom}`);
-      } catch {
-        this.frameEl.src = buildPdfViewerUrl(this.fileUrl, safePage, safeZoom);
-      }
+      if (!this.pdfViewer) return;
+      this.pdfViewer.currentScaleValue = String(safeZoom / 100);
+      this.pdfViewer.currentPageNumber = safePage;
     },
     goToPage(page) {
       this.navigate(page, this.zoomPercent);
@@ -718,16 +757,20 @@ function getOrCreatePdfViewerController(viewerKey) {
     clearSourceKey(cacheKey) {
       if (this.sourceKey !== cacheKey) return;
       this.sourceKey = null;
-      this.fileUrl = null;
+      this.pdfDocument = null;
       this.totalPages = null;
       this.currentPage = 1;
-      this.frameEl.removeAttribute('src');
+      if (this.pdfViewer) this.pdfViewer.setDocument(null);
+      if (this.linkService) this.linkService.setDocument(null, null);
       this.locationEl.textContent = '';
     },
     dispose() {
-      this.frameEl.removeAttribute('src');
+      if (this.pdfViewer) this.pdfViewer.setDocument(null);
+      if (this.linkService) this.linkService.setDocument(null, null);
       if (this.shell.parentElement) this.shell.parentElement.removeChild(this.shell);
       this.mountedContainer = null;
+      this.pdfDocument = null;
+      this.sourceKey = null;
     }
   };
 
@@ -891,11 +934,9 @@ async function renderPdfViewer(source, selectedUnitOrOutlineItem, containerEl, o
         : 1;
 
     const pageNumber = clamp(Math.floor(requestedPage), 1, totalPages);
-    const sourceUrl = source.assetId ? await getAssetObjectUrl(source.assetId) : source.origin;
-    if (!sourceUrl) throw new Error('Stored PDF file is missing. Re-upload this source from Sources page.');
-    controller.open({
+    await controller.open({
       sourceKey: pdfCacheKey,
-      fileUrl: sourceUrl,
+      pdfDocument: pdf,
       page: pageNumber,
       zoomPercent: options.zoomPercent || 120,
       totalPages
