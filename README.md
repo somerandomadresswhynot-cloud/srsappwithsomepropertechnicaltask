@@ -33,8 +33,9 @@ The app will then parse chapters/sections from PDF bookmarks via pypdf first, an
 
 ## Notes
 - The app starts with **no default sources**.
-- Use **Sources → Add Source** to import your own PDF/YouTube/local video metadata.
+- Use **Sources → Add Source** to import your own PDF/YouTube/local video sources.
 - The import modal now supports **drag-and-drop** file upload.
 - Dropped PDFs are automatically scanned in-browser for likely section headers, then those headers seed the outline and review units.
+- Uploaded PDF/local video files are stored in browser IndexedDB and remain available until deleted from the UI.
 - If parsing cannot detect enough headers, the app falls back to a default section template.
 - State is persisted in `localStorage`.

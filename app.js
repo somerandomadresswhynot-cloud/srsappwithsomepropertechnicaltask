@@ -59,10 +59,12 @@ function hydratePersistedState(persistedState) {
 function normalizePersistedSource(source) {
   if (!source || typeof source !== 'object') return source;
   const normalized = normalizeSourceOrigin(source.sourceType, source.origin || source.originRef || '(unknown)');
+  const hasAsset = typeof source.assetId === 'string' && source.assetId.trim();
   return {
     ...source,
-    origin: normalized.ok ? normalized.origin : (source.origin || source.originRef || '(unknown)'),
-    originRef: normalized.ok ? normalized.originRef : (source.originRef || source.origin || '(unknown)'),
+    origin: hasAsset ? '(stored in app)' : (normalized.ok ? normalized.origin : (source.origin || source.originRef || '(unknown)')),
+    originRef: hasAsset ? '(stored in app)' : (normalized.ok ? normalized.originRef : (source.originRef || source.origin || '(unknown)')),
+    assetId: hasAsset ? source.assetId.trim() : null,
     totalPages: Number.isFinite(source.totalPages) ? source.totalPages : null,
     durationSec: Number.isFinite(source.durationSec) ? source.durationSec : null
   };
@@ -143,6 +145,83 @@ function inferSourceMetadata(source, units = []) {
 
 
 const viewerPdfCache = new Map();
+const viewerAssetUrlCache = new Map();
+
+const ASSET_DB_NAME = 'srs-app-assets';
+const ASSET_DB_VERSION = 1;
+const ASSET_STORE_NAME = 'assets';
+let assetDbPromise = null;
+
+function openAssetDb() {
+  if (assetDbPromise) return assetDbPromise;
+  assetDbPromise = new Promise((resolve, reject) => {
+    if (!window.indexedDB) {
+      reject(new Error('IndexedDB is unavailable in this browser.'));
+      return;
+    }
+    const request = window.indexedDB.open(ASSET_DB_NAME, ASSET_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(ASSET_STORE_NAME)) {
+        db.createObjectStore(ASSET_STORE_NAME, { keyPath: 'id' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('Failed to open IndexedDB.'));
+  });
+  return assetDbPromise;
+}
+
+async function putAssetBlob(file) {
+  const db = await openAssetDb();
+  const id = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(ASSET_STORE_NAME, 'readwrite');
+    const store = tx.objectStore(ASSET_STORE_NAME);
+    const request = store.put({ id, blob: file, name: file.name || 'uploaded-file', type: file.type || '', createdAt: Date.now() });
+    request.onsuccess = () => resolve(id);
+    request.onerror = () => reject(request.error || new Error('Failed to store asset blob.'));
+  });
+}
+
+async function getAssetBlob(assetId) {
+  if (!assetId) return null;
+  const db = await openAssetDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(ASSET_STORE_NAME, 'readonly');
+    const store = tx.objectStore(ASSET_STORE_NAME);
+    const request = store.get(assetId);
+    request.onsuccess = () => resolve(request.result?.blob || null);
+    request.onerror = () => reject(request.error || new Error('Failed to load asset blob.'));
+  });
+}
+
+async function deleteAssetBlob(assetId) {
+  if (!assetId) return;
+  const db = await openAssetDb();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(ASSET_STORE_NAME, 'readwrite');
+    const store = tx.objectStore(ASSET_STORE_NAME);
+    const request = store.delete(assetId);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error || new Error('Failed to delete asset blob.'));
+  });
+  const cachedUrl = viewerAssetUrlCache.get(assetId);
+  if (cachedUrl) {
+    URL.revokeObjectURL(cachedUrl);
+    viewerAssetUrlCache.delete(assetId);
+  }
+}
+
+async function getAssetObjectUrl(assetId) {
+  if (!assetId) return null;
+  if (viewerAssetUrlCache.has(assetId)) return viewerAssetUrlCache.get(assetId);
+  const blob = await getAssetBlob(assetId);
+  if (!blob) return null;
+  const url = URL.createObjectURL(blob);
+  viewerAssetUrlCache.set(assetId, url);
+  return url;
+}
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -205,13 +284,17 @@ function normalizeSourceOrigin(sourceType, rawOrigin) {
 
   const isHttp = parsedUrl && ['http:', 'https:'].includes(parsedUrl.protocol);
   const isFileUrl = parsedUrl && parsedUrl.protocol === 'file:';
+  const isBlobUrl = parsedUrl && parsedUrl.protocol === 'blob:';
   const looksLikeLocalPath = /^(\/|~\/|\.\.?\/|[A-Za-z]:[\\/]|\\\\)/.test(origin) || (!parsedUrl && /[\\/]/.test(origin));
 
   if (localTypes.has(sourceType)) {
-    if (!isFileUrl && !looksLikeLocalPath) {
-      return { ok: false, error: 'This source type requires a local file URL/path (e.g., /files/book.pdf or file:///videos/lecture.mp4).' };
+    if (!origin) {
+      return { ok: true, origin: '(stored in app)', originRef: '(stored in app)' };
     }
-    const normalized = isFileUrl ? parsedUrl.toString() : origin.replaceAll('\\\\', '/');
+    if (!isFileUrl && !isBlobUrl && !looksLikeLocalPath) {
+      return { ok: true, origin: '(stored in app)', originRef: '(stored in app)' };
+    }
+    const normalized = (isFileUrl || isBlobUrl) ? parsedUrl.toString() : origin.replaceAll('\\', '/');
     return { ok: true, origin: normalized, originRef: normalized };
   }
 
@@ -485,11 +568,23 @@ function renderUnsupportedViewer(source, containerEl, reason) {
 
 async function loadPdfDocument(source) {
   if (!window.pdfjsLib) throw new Error('pdf.js is not loaded in this session.');
-  if (!source?.origin) throw new Error('PDF source origin/path is missing.');
-  if (viewerPdfCache.has(source.origin)) return viewerPdfCache.get(source.origin);
-  const task = window.pdfjsLib.getDocument(source.origin);
+  const cacheKey = source?.assetId ? `asset:${source.assetId}` : `origin:${source?.origin || ''}`;
+  if (viewerPdfCache.has(cacheKey)) return viewerPdfCache.get(cacheKey);
+
+  let task;
+  if (source?.assetId) {
+    const blob = await getAssetBlob(source.assetId);
+    if (!blob) throw new Error('Stored PDF file is missing. Re-upload this source from Sources page.');
+    const data = await blob.arrayBuffer();
+    task = window.pdfjsLib.getDocument({ data });
+  } else if (source?.origin) {
+    task = window.pdfjsLib.getDocument(source.origin);
+  } else {
+    throw new Error('PDF source file is missing.');
+  }
+
   const pdf = await task.promise;
-  viewerPdfCache.set(source.origin, pdf);
+  viewerPdfCache.set(cacheKey, pdf);
   return pdf;
 }
 
@@ -541,7 +636,7 @@ async function renderPdfViewer(source, selectedUnitOrOutlineItem, containerEl, o
   }
 }
 
-function renderVideoViewer(source, selectedUnitOrOutlineItem, containerEl) {
+async function renderVideoViewer(source, selectedUnitOrOutlineItem, containerEl) {
   const startSec = Math.max(0, Math.floor(selectedUnitOrOutlineItem?.timeStartSec || 0));
   if (source?.sourceType === 'youtube') {
     const baseEmbed = deriveYouTubeEmbedUrl(source.origin || '');
@@ -555,11 +650,12 @@ function renderVideoViewer(source, selectedUnitOrOutlineItem, containerEl) {
   }
 
   if (source?.sourceType === 'local_video') {
-    if (!source.origin) {
-      renderUnsupportedViewer(source, containerEl, 'Local video path/URL is missing.');
+    const localVideoUrl = source.assetId ? await getAssetObjectUrl(source.assetId) : source.origin;
+    if (!localVideoUrl) {
+      renderUnsupportedViewer(source, containerEl, 'Stored video file is missing. Re-upload this source from Sources page.');
       return;
     }
-    containerEl.innerHTML = `<div class="viewer-location">Video at ${startSec}s</div><video class="video-player" controls src="${source.origin}"></video>`;
+    containerEl.innerHTML = `<div class="viewer-location">Video at ${startSec}s</div><video class="video-player" controls src="${localVideoUrl}"></video>`;
     const videoEl = containerEl.querySelector('video');
     videoEl.addEventListener('loadedmetadata', () => {
       try { videoEl.currentTime = startSec; } catch {}
@@ -581,7 +677,7 @@ function renderSourceViewer(source, selectedUnitOrOutlineItem, containerEl, opti
     return;
   }
   if (source.sourceType === 'youtube' || source.sourceType === 'local_video') {
-    renderVideoViewer(source, selectedUnitOrOutlineItem, containerEl, options);
+    void renderVideoViewer(source, selectedUnitOrOutlineItem, containerEl, options);
     return;
   }
   renderUnsupportedViewer(source, containerEl);
@@ -611,6 +707,7 @@ ensureQueueConsistency();
 normalizeQueueSelection();
 const importDraft = {
   file: null,
+  objectUrl: null,
   parsedSections: [],
   parsedPdfTotalPages: null,
   detectedVideoDurationSec: null,
@@ -640,6 +737,11 @@ async function importSourceFromForm() {
   const videoDurationRaw = document.getElementById('import-video-duration')?.value || '';
   if (!title || !size) return alert('Title and size are required.');
 
+  const requiresUploadedAsset = sourceType === 'pdf' || sourceType === 'local_video';
+  if (requiresUploadedAsset && !importDraft.file) {
+    return alert('Please upload the source file in the dropzone first. This source type is stored inside the app.');
+  }
+
   const normalizedOrigin = normalizeSourceOrigin(sourceType, origin);
   if (!normalizedOrigin.ok) return alert(normalizedOrigin.error);
 
@@ -662,11 +764,21 @@ async function importSourceFromForm() {
     totalStudySeconds: 0,
     lastUpdatedAt: new Date().toISOString().slice(0, 10),
     priority: 'none',
-    origin: normalizedOrigin.origin,
-    originRef: normalizedOrigin.originRef,
+    origin: requiresUploadedAsset ? '(stored in app)' : normalizedOrigin.origin,
+    originRef: requiresUploadedAsset ? '(stored in app)' : normalizedOrigin.originRef,
+    assetId: null,
     totalPages: null,
     durationSec: Number.isFinite(parsedByAdapter.durationSec) ? parsedByAdapter.durationSec : null
   };
+
+  if (requiresUploadedAsset) {
+    try {
+      source.assetId = await putAssetBlob(importDraft.file);
+    } catch (error) {
+      alert(`Could not store uploaded file in app storage: ${error.message}`);
+      return;
+    }
+  }
 
   state.data.sources.push(source);
   if (source.sourceType === 'pdf' && Number.isFinite(parsedByAdapter.pdfTotalPages)) {
@@ -1096,7 +1208,13 @@ function reconcileQueueFlagsFromHierarchy() {
 }
 
 async function processImportedFile(file) {
+  if (importDraft.objectUrl) {
+    URL.revokeObjectURL(importDraft.objectUrl);
+    importDraft.objectUrl = null;
+  }
+
   importDraft.file = file;
+  importDraft.objectUrl = URL.createObjectURL(file);
   importDraft.parsedSections = [];
   importDraft.parsedPdfTotalPages = null;
   importDraft.detectedVideoDurationSec = null;
@@ -1105,10 +1223,11 @@ async function processImportedFile(file) {
   const status = document.getElementById('import-parse-status');
 
   document.getElementById('import-title').value = file.name;
-  document.getElementById('import-origin').value = file.name;
+  const typeField = document.getElementById('import-type');
+  if (isPdf) typeField.value = 'pdf';
+  if (isVideo) typeField.value = 'local_video';
+  document.getElementById('import-origin').value = typeField.value === 'youtube' ? '' : '(stored in app)';
   document.getElementById('import-size').value = isPdf ? `${Math.max(1, Math.round(file.size / 1024 / 1024))} MB PDF` : `${Math.max(1, Math.round(file.size / 1024))} KB file`;
-  if (isPdf) document.getElementById('import-type').value = 'pdf';
-  if (isVideo) document.getElementById('import-type').value = 'local_video';
   updateImportTypeHints();
 
   if (isVideo) {
@@ -1164,37 +1283,51 @@ function updateImportTypeHints() {
   if (!hint) return;
 
   if (type === 'pdf') {
-    hint.textContent = 'PDF hint: dropping a PDF tries to detect outline headers automatically.';
+    hint.textContent = 'PDF hint: upload file in dropzone; app stores it locally and parses headers automatically.';
     chaptersWrap?.classList.add('hidden');
     durationWrap?.classList.add('hidden');
-    if (originField) originField.placeholder = '/path/file.pdf or file:///path/file.pdf';
+    if (originField) {
+      originField.disabled = true;
+      originField.value = '(stored in app)';
+      originField.placeholder = 'Stored in app after upload';
+    }
     return;
   }
 
   if (type === 'youtube') {
-    hint.textContent = 'Video hint: timestamp chapters are optional. If omitted, segments are auto-generated from actual duration.';
+    hint.textContent = 'YouTube hint: paste a full URL. Timestamp chapters are optional.';
     chaptersWrap?.classList.remove('hidden');
     durationWrap?.classList.remove('hidden');
-    if (originField) originField.placeholder = 'https://youtube.com/watch?v=...';
+    if (originField) {
+      originField.disabled = false;
+      if (originField.value === '(stored in app)') originField.value = '';
+      originField.placeholder = 'https://youtube.com/watch?v=...';
+    }
     return;
   }
 
   if (type === 'local_video') {
-    hint.textContent = 'Local video hint: timestamp chapters optional. If omitted, segments are auto-generated from actual duration.';
+    hint.textContent = 'Local video hint: upload file in dropzone; app stores it locally. Chapters are optional.';
     chaptersWrap?.classList.remove('hidden');
     durationWrap?.classList.remove('hidden');
-    if (originField) originField.placeholder = '/path/video.mp4 or file:///path/video.mp4';
+    if (originField) {
+      originField.disabled = true;
+      originField.value = '(stored in app)';
+      originField.placeholder = 'Stored in app after upload';
+    }
     return;
   }
 
   hint.textContent = 'Fill in metadata and import.';
   chaptersWrap?.classList.add('hidden');
   durationWrap?.classList.add('hidden');
+  if (originField) originField.disabled = false;
 }
 
 
 function openImportModal() {
   importDraft.file = null;
+  importDraft.objectUrl = null;
   importDraft.parsedSections = [];
   importDraft.parsedPdfTotalPages = null;
   importDraft.detectedVideoDurationSec = null;
@@ -1218,7 +1351,7 @@ function openImportModal() {
       <label id="import-video-duration-wrap" class="hidden">Video duration seconds (optional, used when chapters missing)<input id="import-video-duration" placeholder="e.g. 5420 or 01:30:20"></label>
       <label>Size Label <input id="import-size" placeholder="e.g. 240 pages or 90 min"></label>
       <label>Tags (comma-separated) <input id="import-tags" placeholder="biology, textbook"></label>
-      <label>Origin / Path / URL <input id="import-origin" placeholder="/path/file.pdf or https://youtube.com/..." ></label>
+      <label>Source URL (YouTube only) <input id="import-origin" placeholder="https://youtube.com/..." ></label>
       <div class="row"><button class="btn" id="confirm-import">Import</button><button class="btn" id="cancel-import">Cancel</button></div>
     </div></div>`;
   document.body.appendChild(wrap);
@@ -1260,7 +1393,11 @@ function openImportModal() {
 }
 
 function closeImportModal() {
+  if (importDraft.objectUrl) {
+    URL.revokeObjectURL(importDraft.objectUrl);
+  }
   importDraft.file = null;
+  importDraft.objectUrl = null;
   importDraft.parsedSections = [];
   importDraft.parsedPdfTotalPages = null;
   importDraft.detectedVideoDurationSec = null;
@@ -1291,13 +1428,13 @@ function openDeleteSourceModal(source) {
 
   document.getElementById('close-delete-source').onclick = close;
   document.getElementById('cancel-delete-source').onclick = close;
-  confirmButton.onclick = () => {
-    deleteSource(source.id);
+  confirmButton.onclick = async () => {
+    await deleteSource(source.id);
     close();
   };
 }
 
-function deleteSource(sourceId) {
+async function deleteSource(sourceId) {
   const sourceIndex = state.data.sources.findIndex(s => s.id === sourceId);
   if (sourceIndex === -1) return;
 
@@ -1326,6 +1463,14 @@ function deleteSource(sourceId) {
 
   if (!state.data.sources.length && state.view.page === 'portal') {
     state.view.page = 'sources';
+  }
+
+  if (removedSource.assetId) {
+    try {
+      await deleteAssetBlob(removedSource.assetId);
+    } catch (error) {
+      console.warn('Failed to remove stored asset blob:', error);
+    }
   }
 
   console.info(`Deleted source: ${removedSource.title}`);
