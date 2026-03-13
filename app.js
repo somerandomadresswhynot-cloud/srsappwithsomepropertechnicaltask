@@ -146,7 +146,16 @@ function inferSourceMetadata(source, units = []) {
 
 const viewerPdfCache = new Map();
 const viewerPdfPageCountCache = new Map();
+const viewerPdfBytesCache = new Map();
+const viewerPdfPageCache = new Map();
+const viewerPdfRenderCache = new Map();
 const viewerAssetUrlCache = new Map();
+
+const PDF_BYTES_BUDGET = 150 * 1024 * 1024;
+const PDF_RENDER_BUDGET = 64 * 1024 * 1024;
+const PDF_RENDER_MAX_ENTRIES = 12;
+const PDF_ACTIVE_DOC_LIMIT = 2;
+const PDF_PAGE_WINDOW_RADIUS = 2;
 
 const ASSET_DB_NAME = 'srs-app-assets';
 const ASSET_DB_VERSION = 1;
@@ -214,8 +223,19 @@ async function deleteAssetBlob(assetId) {
   }
 
   const pdfCacheKey = `asset:${assetId}`;
+  const cachedPdf = viewerPdfCache.get(pdfCacheKey);
+  if (cachedPdf?.destroy) {
+    try { cachedPdf.destroy(); } catch {}
+  }
   viewerPdfCache.delete(pdfCacheKey);
   viewerPdfPageCountCache.delete(pdfCacheKey);
+  viewerPdfBytesCache.delete(pdfCacheKey);
+  for (const pageKey of [...viewerPdfPageCache.keys()]) {
+    if (pageKey.startsWith(`${pdfCacheKey}:`)) viewerPdfPageCache.delete(pageKey);
+  }
+  for (const renderKey of [...viewerPdfRenderCache.keys()]) {
+    if (renderKey.startsWith(`${pdfCacheKey}:`)) viewerPdfRenderCache.delete(renderKey);
+  }
 }
 
 async function getAssetObjectUrl(assetId) {
@@ -234,6 +254,61 @@ function clamp(value, min, max) {
 
 function getPdfSourceCacheKey(source) {
   return source?.assetId ? `asset:${source.assetId}` : `origin:${source?.origin || ''}`;
+}
+
+function evictPdfBytesCacheIfNeeded() {
+  let total = [...viewerPdfBytesCache.values()].reduce((sum, entry) => sum + (entry.sizeBytes || 0), 0);
+  if (total <= PDF_BYTES_BUDGET) return;
+  const entries = [...viewerPdfBytesCache.entries()].sort((a, b) => (a[1].lastUsedAt || 0) - (b[1].lastUsedAt || 0));
+  for (const [key, entry] of entries) {
+    viewerPdfBytesCache.delete(key);
+    total -= entry.sizeBytes || 0;
+    if (total <= PDF_BYTES_BUDGET) break;
+  }
+}
+
+function evictPdfDocumentsIfNeeded(activeKey) {
+  const entries = [...viewerPdfCache.entries()];
+  if (entries.length <= PDF_ACTIVE_DOC_LIMIT) return;
+  const candidates = entries
+    .filter(([key]) => key !== activeKey)
+    .sort((a, b) => ((a[1]?.__lastUsedAt || 0) - (b[1]?.__lastUsedAt || 0)));
+
+  for (const [key, doc] of candidates) {
+    if (viewerPdfCache.size <= PDF_ACTIVE_DOC_LIMIT) break;
+    viewerPdfCache.delete(key);
+    if (doc?.destroy) {
+      try { doc.destroy(); } catch {}
+    }
+    for (const pageKey of [...viewerPdfPageCache.keys()]) {
+      if (pageKey.startsWith(`${key}:`)) viewerPdfPageCache.delete(pageKey);
+    }
+    for (const renderKey of [...viewerPdfRenderCache.keys()]) {
+      if (renderKey.startsWith(`${key}:`)) viewerPdfRenderCache.delete(renderKey);
+    }
+  }
+}
+
+function evictPdfRenderCacheIfNeeded() {
+  let total = [...viewerPdfRenderCache.values()].reduce((sum, entry) => sum + (entry.bytesEstimate || 0), 0);
+  if (total <= PDF_RENDER_BUDGET && viewerPdfRenderCache.size <= PDF_RENDER_MAX_ENTRIES) return;
+  const entries = [...viewerPdfRenderCache.entries()].sort((a, b) => (a[1].lastUsedAt || 0) - (b[1].lastUsedAt || 0));
+  for (const [key, entry] of entries) {
+    viewerPdfRenderCache.delete(key);
+    total -= entry.bytesEstimate || 0;
+    if (total <= PDF_RENDER_BUDGET && viewerPdfRenderCache.size <= PDF_RENDER_MAX_ENTRIES) break;
+  }
+}
+
+function trimPdfPageCache(sourceKey, currentPage) {
+  for (const pageKey of [...viewerPdfPageCache.keys()]) {
+    if (!pageKey.startsWith(`${sourceKey}:`)) continue;
+    const page = Number(pageKey.split(':').pop());
+    if (!Number.isFinite(page)) continue;
+    if (Math.abs(page - currentPage) > PDF_PAGE_WINDOW_RADIUS) {
+      viewerPdfPageCache.delete(pageKey);
+    }
+  }
 }
 
 function escapeHtml(value) {
@@ -575,17 +650,49 @@ function renderUnsupportedViewer(source, containerEl, reason) {
   containerEl.innerHTML = `<div class="viewer-fallback"><h4>Viewer unavailable</h4><p>${escapeHtml(reason || `No renderer available for source type "${source?.sourceType || 'unknown'}".`)}</p></div>`;
 }
 
-async function loadPdfDocument(source) {
-  if (!window.pdfjsLib) throw new Error('pdf.js is not loaded in this session.');
-  const cacheKey = source?.assetId ? `asset:${source.assetId}` : `origin:${source?.origin || ''}`;
-  if (viewerPdfCache.has(cacheKey)) return viewerPdfCache.get(cacheKey);
+async function getPdfBytesForSource(source) {
+  const sourceKey = getPdfSourceCacheKey(source);
+  const cached = viewerPdfBytesCache.get(sourceKey);
+  if (cached?.bytes) {
+    cached.lastUsedAt = Date.now();
+    return cached.bytes;
+  }
 
-  let task;
+  let bytes;
   if (source?.assetId) {
     const blob = await getAssetBlob(source.assetId);
     if (!blob) throw new Error('Stored PDF file is missing. Re-upload this source from Sources page.');
-    const data = await blob.arrayBuffer();
-    task = window.pdfjsLib.getDocument({ data });
+    bytes = new Uint8Array(await blob.arrayBuffer());
+  } else if (source?.origin) {
+    try {
+      const response = await fetch(source.origin);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      bytes = new Uint8Array(await response.arrayBuffer());
+    } catch {
+      return null;
+    }
+  } else {
+    throw new Error('PDF source file is missing.');
+  }
+
+  viewerPdfBytesCache.set(sourceKey, { bytes, sizeBytes: bytes.byteLength, lastUsedAt: Date.now() });
+  evictPdfBytesCacheIfNeeded();
+  return bytes;
+}
+
+async function loadPdfDocument(source) {
+  if (!window.pdfjsLib) throw new Error('pdf.js is not loaded in this session.');
+  const cacheKey = getPdfSourceCacheKey(source);
+  if (viewerPdfCache.has(cacheKey)) {
+    const cached = viewerPdfCache.get(cacheKey);
+    cached.__lastUsedAt = Date.now();
+    return cached;
+  }
+
+  const bytes = await getPdfBytesForSource(source);
+  let task;
+  if (bytes) {
+    task = window.pdfjsLib.getDocument({ data: bytes });
   } else if (source?.origin) {
     task = window.pdfjsLib.getDocument(source.origin);
   } else {
@@ -593,8 +700,64 @@ async function loadPdfDocument(source) {
   }
 
   const pdf = await task.promise;
+  pdf.__lastUsedAt = Date.now();
   viewerPdfCache.set(cacheKey, pdf);
+  evictPdfDocumentsIfNeeded(cacheKey);
   return pdf;
+}
+
+async function loadPdfPage(pdf, sourceKey, pageNumber) {
+  const pageKey = `${sourceKey}:${pageNumber}`;
+  if (viewerPdfPageCache.has(pageKey)) return viewerPdfPageCache.get(pageKey);
+  const page = await pdf.getPage(pageNumber);
+  viewerPdfPageCache.set(pageKey, page);
+  trimPdfPageCache(sourceKey, pageNumber);
+  return page;
+}
+
+async function renderPdfPageToCanvas({ pdf, sourceKey, pageNumber, scale, targetCanvas }) {
+  const renderScale = Number(scale.toFixed(2));
+  const renderKey = `${sourceKey}:${pageNumber}:${renderScale}`;
+  const cached = viewerPdfRenderCache.get(renderKey);
+
+  const ctx = targetCanvas.getContext('2d', { alpha: false });
+  if (cached?.canvas) {
+    cached.lastUsedAt = Date.now();
+    targetCanvas.width = cached.width;
+    targetCanvas.height = cached.height;
+    targetCanvas.style.width = `${cached.width}px`;
+    targetCanvas.style.height = `${cached.height}px`;
+    ctx.drawImage(cached.canvas, 0, 0);
+    return { width: cached.width, height: cached.height, fromCache: true };
+  }
+
+  const page = await loadPdfPage(pdf, sourceKey, pageNumber);
+  const viewport = page.getViewport({ scale: renderScale });
+  const width = Math.ceil(viewport.width);
+  const height = Math.ceil(viewport.height);
+
+  targetCanvas.width = width;
+  targetCanvas.height = height;
+  targetCanvas.style.width = `${width}px`;
+  targetCanvas.style.height = `${height}px`;
+
+  await page.render({ canvasContext: ctx, viewport }).promise;
+
+  const cacheCanvas = document.createElement('canvas');
+  cacheCanvas.width = width;
+  cacheCanvas.height = height;
+  const cacheCtx = cacheCanvas.getContext('2d', { alpha: false });
+  cacheCtx.drawImage(targetCanvas, 0, 0);
+
+  viewerPdfRenderCache.set(renderKey, {
+    canvas: cacheCanvas,
+    width,
+    height,
+    bytesEstimate: width * height * 4,
+    lastUsedAt: Date.now()
+  });
+  evictPdfRenderCacheIfNeeded();
+  return { width, height, fromCache: false };
 }
 
 async function renderPdfViewer(source, selectedUnitOrOutlineItem, containerEl, options = {}) {
@@ -603,18 +766,17 @@ async function renderPdfViewer(source, selectedUnitOrOutlineItem, containerEl, o
 
   try {
     const pdfCacheKey = getPdfSourceCacheKey(source);
-    const existingFrame = containerEl.querySelector('iframe.pdf-frame');
-    const existingLocation = containerEl.querySelector('.viewer-location');
-    const pdfUrl = source?.assetId ? await getAssetObjectUrl(source.assetId) : source?.origin;
-    if (!pdfUrl) {
-      renderUnsupportedViewer(source, containerEl, 'PDF source file is missing.');
-      return;
+    let pageWrap = containerEl.querySelector('.pdf-page-wrap');
+    let canvas = containerEl.querySelector('canvas.pdf-canvas');
+    let locationEl = containerEl.querySelector('.viewer-location');
+
+    if (!pageWrap || !canvas || !locationEl || containerEl.dataset.pdfSourceCacheKey !== pdfCacheKey) {
+      containerEl.innerHTML = '<div class="small">Loading PDF preview…</div>';
     }
 
     let totalPages = viewerPdfPageCountCache.get(pdfCacheKey);
+    const pdf = await loadPdfDocument(source);
     if (!Number.isFinite(totalPages)) {
-      if (!existingFrame) containerEl.innerHTML = '<div class="small">Loading PDF preview…</div>';
-      const pdf = await loadPdfDocument(source);
       totalPages = pdf.numPages;
       viewerPdfPageCountCache.set(pdfCacheKey, totalPages);
     }
@@ -624,28 +786,31 @@ async function renderPdfViewer(source, selectedUnitOrOutlineItem, containerEl, o
       : Number.isFinite(options.defaultPage)
         ? options.defaultPage
         : 1;
+
     const pageNumber = clamp(Math.floor(requestedPage), 1, totalPages);
-    const zoomPercent = Math.round(clamp(options.zoomPercent || 120, 50, 250));
-    const viewerUrl = `${pdfUrl}#page=${pageNumber}&zoom=${zoomPercent}`;
+    const scale = clamp((options.zoomPercent || 120) / 100, 0.5, 2.4);
 
     if (containerEl.dataset.renderToken !== renderToken) return;
 
-    if (containerEl.dataset.pdfSourceCacheKey === pdfCacheKey && existingFrame && existingLocation) {
-      existingLocation.textContent = `PDF page ${pageNumber} of ${totalPages}`;
-      const existingSrc = existingFrame.getAttribute('src') || '';
-      const currentBase = existingSrc.split('#')[0];
-      const nextBase = pdfUrl.split('#')[0];
-      const nextSrc = currentBase === nextBase
-        ? `${currentBase}#page=${pageNumber}&zoom=${zoomPercent}`
-        : viewerUrl;
-      if (existingSrc !== nextSrc) {
-        existingFrame.setAttribute('src', nextSrc);
-      }
-      return;
+    if (!pageWrap || !canvas || !locationEl || containerEl.dataset.pdfSourceCacheKey !== pdfCacheKey) {
+      containerEl.dataset.pdfSourceCacheKey = pdfCacheKey;
+      containerEl.innerHTML = `<div class="viewer-location">PDF page ${pageNumber} of ${totalPages}</div><div class="pdf-page-wrap"><canvas class="pdf-canvas"></canvas></div>`;
+      locationEl = containerEl.querySelector('.viewer-location');
+      pageWrap = containerEl.querySelector('.pdf-page-wrap');
+      canvas = containerEl.querySelector('canvas.pdf-canvas');
+    } else {
+      locationEl.textContent = `PDF page ${pageNumber} of ${totalPages}`;
     }
 
-    containerEl.dataset.pdfSourceCacheKey = pdfCacheKey;
-    containerEl.innerHTML = `<div class="viewer-location">PDF page ${pageNumber} of ${totalPages}</div><iframe class="pdf-frame" src="${escapeHtml(viewerUrl)}" title="PDF viewer" loading="lazy"></iframe>`;
+    await renderPdfPageToCanvas({
+      pdf,
+      sourceKey: pdfCacheKey,
+      pageNumber,
+      scale,
+      targetCanvas: canvas
+    });
+
+    pageWrap.style.width = `${canvas.width}px`;
   } catch (error) {
     renderUnsupportedViewer(source, containerEl, `Unable to render PDF preview: ${error.message}`);
   }
@@ -1635,8 +1800,30 @@ function renderPortal() {
   };
 
   document.querySelectorAll('[data-toggle]').forEach(el => el.onclick = onToggleQueue);
-  document.getElementById('zoom-in').onclick = () => { v.viewerZoom = Math.min(200, (v.viewerZoom || 120) + 10); renderPortal(); save(); };
-  document.getElementById('zoom-out').onclick = () => { v.viewerZoom = Math.max(50, (v.viewerZoom || 120) - 10); renderPortal(); save(); };
+  document.getElementById('zoom-in').onclick = () => {
+    v.viewerZoom = Math.min(200, (v.viewerZoom || 120) + 10);
+    const selectedItem = outline.find(x => x.id === v.selectedHierarchyItemId) || selected;
+    const selectedItemUnit = selectedItem ? state.data.units.find(u => u.sourceId === source.id && u.hierarchyId === selectedItem.id) || null : null;
+    const zoomLabel = document.getElementById('portal-zoom-label');
+    if (zoomLabel) zoomLabel.textContent = `${v.viewerZoom}%`;
+    renderSourceViewer(source, selectedItemUnit || selectedItem, viewerEl, {
+      zoomPercent: v.viewerZoom || 120,
+      defaultPage: v.viewerPage || 1
+    });
+    save();
+  };
+  document.getElementById('zoom-out').onclick = () => {
+    v.viewerZoom = Math.max(50, (v.viewerZoom || 120) - 10);
+    const selectedItem = outline.find(x => x.id === v.selectedHierarchyItemId) || selected;
+    const selectedItemUnit = selectedItem ? state.data.units.find(u => u.sourceId === source.id && u.hierarchyId === selectedItem.id) || null : null;
+    const zoomLabel = document.getElementById('portal-zoom-label');
+    if (zoomLabel) zoomLabel.textContent = `${v.viewerZoom}%`;
+    renderSourceViewer(source, selectedItemUnit || selectedItem, viewerEl, {
+      zoomPercent: v.viewerZoom || 120,
+      defaultPage: v.viewerPage || 1
+    });
+    save();
+  };
   rememberViewerPosition(source.id, controller.getPosition() || selectedLocator);
 }
 
