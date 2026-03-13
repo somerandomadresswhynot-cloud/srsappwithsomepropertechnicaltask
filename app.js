@@ -1566,7 +1566,7 @@ function renderPortal() {
   if (!v.selectedHierarchyItemId && selected) v.selectedHierarchyItemId = selected.id;
 
   pageRoot.innerHTML = `<div class="portal"><aside class="panel"><div style="padding:10px"><h3>${source.title}</h3><input id="outline-search" placeholder="Search outline" value="${v.outlineSearchText}"></div><div class="outline-tools"><span class="small">Queue all</span><button class="queue-master ${allInQueue ? 'queue-on' : 'queue-off'}" id="toggle-all-queue" title="${allInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue'}" aria-label="${allInQueue ? 'Turn all OFF in queue' : 'Turn all ON in queue'}"></button></div><div class="outline-list">${filtered.map(item => `<div class="outline-item ${item.id === selected?.id ? 'selected' : ''}" data-item="${item.id}"><div><div class="indent" style="--depth:${item.depth}">${item.isLeaf ? '📄' : '📁'} ${item.title}</div>${formatRangeLabel(item) ? `<div class="small" style="padding-left:${Math.min(item.depth + 1, 6) * 16}px">${formatRangeLabel(item)}</div>` : ''}</div>${renderQueueBars(item)}</div>`).join('') || '<p class="small" style="padding:8px">No outline items.</p>'}</div></aside>
-  <section class="panel viewer"><div class="row" style="justify-content:space-between"><h3>Viewer</h3><div class="controls"><button class="btn" id="zoom-out">-</button><span>${v.viewerZoom || 120}%</span><button class="btn" id="zoom-in">+</button><button class="btn" id="portal-jump" ${selectedLocator ? '' : 'disabled'}>Jump to selected</button></div></div><div class="small">${selected?.title || 'No item selected'}</div><div class="small">${selectedLocator ? 'Location available' : 'location unavailable'}</div><div id="portal-viewer-content" class="viewer-doc"></div></section>
+  <section class="panel viewer"><div class="row" style="justify-content:space-between"><h3>Viewer</h3><div class="controls"><button class="btn" id="zoom-out">-</button><span id="portal-zoom-label">${v.viewerZoom || 120}%</span><button class="btn" id="zoom-in">+</button><button class="btn" id="portal-jump" ${selectedLocator ? '' : 'disabled'}>Jump to selected</button></div></div><div class="small" id="portal-selected-title">${selected?.title || 'No item selected'}</div><div class="small" id="portal-selected-location">${selectedLocator ? 'Location available' : 'location unavailable'}</div><div id="portal-viewer-content" class="viewer-doc"></div></section>
   <aside class="panel" style="padding:12px"><h3>Unit Meta</h3><div class="small">Source Type: ${source.sourceType}</div><div class="small">Priority: ${source.priority}</div><div class="small">Units: ${source.totalUnits}</div><div class="small">Queue On/Off via bars in outline.</div></aside></div>`;
 
   const viewerEl = document.getElementById('portal-viewer-content');
@@ -1590,17 +1590,41 @@ function renderPortal() {
     syncSelectionAcrossPortalAndQueue(source, item, unit);
     if (locator?.kind === 'page') controller.goToPage(locator.page);
     if (locator?.kind === 'time') controller.seekTo(locator.seconds);
-    rememberViewerPosition(source.id, controller.getPosition() || locator);
-    renderPortal();
+
+    const selectedTitleEl = document.getElementById('portal-selected-title');
+    const selectedLocationEl = document.getElementById('portal-selected-location');
+    const jumpEl = document.getElementById('portal-jump');
+    if (selectedTitleEl) selectedTitleEl.textContent = item?.title || 'No item selected';
+    if (selectedLocationEl) selectedLocationEl.textContent = locator ? 'Location available' : 'location unavailable';
+    if (jumpEl) jumpEl.disabled = !locator;
+
+    document.querySelectorAll('.outline-item[data-item]').forEach(node => {
+      node.classList.toggle('selected', node.getAttribute('data-item') === item?.id);
+    });
+
+    renderSourceViewer(source, unit || item, viewerEl, {
+      zoomPercent: v.viewerZoom || 120,
+      defaultPage: v.viewerPage || 1
+    });
+
+    rememberViewerPosition(source.id, locator || controller.getPosition());
     save();
   });
 
   document.getElementById('portal-jump').onclick = () => {
-    if (!selectedLocator) return;
-    if (selectedLocator.kind === 'page') controller.goToPage(selectedLocator.page);
-    if (selectedLocator.kind === 'time') controller.seekTo(selectedLocator.seconds);
-    rememberViewerPosition(source.id, controller.getPosition() || selectedLocator);
-    renderPortal();
+    const activeItem = outline.find(x => x.id === v.selectedHierarchyItemId) || null;
+    const activeUnit = activeItem ? state.data.units.find(u => u.sourceId === source.id && u.hierarchyId === activeItem.id) || null : null;
+    const activeLocator = activeItem ? (getLocatorForHierarchyItem(source, activeItem) || getLocatorForUnit(activeUnit)) : null;
+    if (!activeLocator) return;
+    if (activeLocator.kind === 'page') controller.goToPage(activeLocator.page);
+    if (activeLocator.kind === 'time') controller.seekTo(activeLocator.seconds);
+
+    renderSourceViewer(source, activeUnit || activeItem, viewerEl, {
+      zoomPercent: v.viewerZoom || 120,
+      defaultPage: v.viewerPage || 1
+    });
+
+    rememberViewerPosition(source.id, activeLocator || controller.getPosition());
     save();
   };
 
