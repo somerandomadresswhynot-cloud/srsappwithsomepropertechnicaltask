@@ -595,42 +595,23 @@ async function renderPdfViewer(source, selectedUnitOrOutlineItem, containerEl, o
 
   try {
     const pdf = await loadPdfDocument(source);
+    const pdfUrl = source?.assetId ? await getAssetObjectUrl(source.assetId) : source?.origin;
+    if (!pdfUrl) {
+      renderUnsupportedViewer(source, containerEl, 'PDF source file is missing.');
+      return;
+    }
+
     const requestedPage = Number.isFinite(selectedUnitOrOutlineItem?.pageStart)
       ? selectedUnitOrOutlineItem.pageStart
       : Number.isFinite(options.defaultPage)
         ? options.defaultPage
         : 1;
     const pageNumber = clamp(Math.floor(requestedPage), 1, pdf.numPages);
-    const scale = clamp((options.zoomPercent || 120) / 100, 0.5, 2.5);
-    const page = await pdf.getPage(pageNumber);
-    const viewport = page.getViewport({ scale });
+    const zoomPercent = Math.round(clamp(options.zoomPercent || 120, 50, 250));
+    const viewerUrl = `${pdfUrl}#page=${pageNumber}&zoom=${zoomPercent}`;
 
     if (containerEl.dataset.renderToken !== renderToken) return;
-    containerEl.innerHTML = `<div class="viewer-location">PDF page ${pageNumber} of ${pdf.numPages}</div>`;
-
-    const pageWrap = document.createElement('div');
-    pageWrap.className = 'pdf-page-wrap';
-    pageWrap.style.width = `${Math.ceil(viewport.width)}px`;
-
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.ceil(viewport.width);
-    canvas.height = Math.ceil(viewport.height);
-    canvas.className = 'pdf-canvas';
-
-    const textLayer = document.createElement('div');
-    textLayer.className = 'pdf-text-layer';
-    textLayer.style.width = `${Math.ceil(viewport.width)}px`;
-    textLayer.style.height = `${Math.ceil(viewport.height)}px`;
-
-    pageWrap.append(canvas, textLayer);
-    containerEl.append(pageWrap);
-
-    const context = canvas.getContext('2d', { alpha: false });
-    await page.render({ canvasContext: context, viewport }).promise;
-
-    const text = await page.getTextContent();
-    const textLayerTask = window.pdfjsLib.renderTextLayer({ textContent: text, container: textLayer, viewport });
-    if (textLayerTask?.promise) await textLayerTask.promise;
+    containerEl.innerHTML = `<div class="viewer-location">PDF page ${pageNumber} of ${pdf.numPages}</div><iframe class="pdf-frame" src="${escapeHtml(viewerUrl)}" title="PDF viewer" loading="lazy"></iframe>`;
   } catch (error) {
     renderUnsupportedViewer(source, containerEl, `Unable to render PDF preview: ${error.message}`);
   }
